@@ -23,7 +23,7 @@ Usage:
 First run auto-creates a venv and installs bleak + rich + textual.
 """
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 import argparse
 import asyncio
@@ -636,6 +636,62 @@ NEARBY_ACTION = {
     0x0E: "Phone call / FaceTime",
 }
 
+# ── Continuity Spam Detection ────────────────────────────────────────
+# Known attack signatures in Apple Continuity manufacturer data (0x4C).
+# Each maps a hex prefix of the TLV payload to (name, severity).
+# Severity: "critical" = potential exploit/dangerous, "warning" = known spam, "info" = nuisance
+SPAM_SIGNATURES = {
+    "071905": ("Fake AirTag — 'AirTag Found Moving With You' spam", "warning"),
+    "071907": ("'Setup New Device' popup spam", "warning"),
+    "071901": ("'Not Your Device' popup spam", "warning"),
+    "0f05c0": ("Continuity Action Modal popup spam", "warning"),
+    "0f0540": ("Action Modal variant spam", "warning"),
+    "000010": ("iOS 17 crash exploit (CVE-2023-38539)", "critical"),
+    "07190f": ("Fake Apple TV / Apple Watch popup", "warning"),
+    "071913": ("Fake Apple Watch variant popup", "warning"),
+}
+
+
+def detect_continuity_spam(manufacturer_data_bytes):
+    """Check Apple Continuity manufacturer data against known spam signatures.
+
+    Args:
+        manufacturer_data_bytes: Raw manufacturer data bytes (including the
+            2-byte Apple company ID prefix).
+
+    Returns:
+        List of (signature_name, severity) tuples for any matches.
+    """
+    matches = []
+    if not manufacturer_data_bytes or len(manufacturer_data_bytes) < 2:
+        return matches
+    # Skip the 2-byte Apple company ID (0x4C, 0x00) prefix
+    payload = manufacturer_data_bytes[2:]
+    if not payload:
+        return matches
+    # The payload contains TLVs; check the first few bytes of each
+    # sub-payload against known signatures
+    i = 0
+    n = len(payload)
+    while i + 1 < n:
+        tlv_type = payload[i]
+        tlv_len = payload[i + 1]
+        if tlv_len == 0 or i + 2 + tlv_len > n:
+            tlv_payload = payload[i + 2:]
+        else:
+            tlv_payload = payload[i + 2: i + 2 + tlv_len]
+        # Check first 3 bytes of this TLV's payload as a hex signature
+        if len(tlv_payload) >= 3:
+            sig = tlv_payload[:3].hex()
+            if sig in SPAM_SIGNATURES:
+                matches.append(SPAM_SIGNATURES[sig])
+        elif len(tlv_payload) >= 1:
+            sig = tlv_payload.hex()
+            if sig in SPAM_SIGNATURES:
+                matches.append(SPAM_SIGNATURES[sig])
+        i += 2 + tlv_len
+    return matches
+
 
 def parse_apple_tlvs(data):
     """Parse Apple manufacturer payload into [(type, bytes)] TLVs."""
@@ -824,8 +880,10 @@ def scan_ble(seconds):
 
         apple_id = None
         apple_det = []
+        spam_matches = []
         if is_apple:
             apple_id, apple_det = decode_apple_identity(md)
+            spam_matches = detect_continuity_spam(bytes(md.get(APPLE_COMPANY_ID, b"")))
 
         found.append({
             "id": addr,
@@ -839,6 +897,7 @@ def scan_ble(seconds):
             "connected": False,
             "apple_identity": apple_id,
             "apple_details": apple_det,
+            "spam_signatures": spam_matches,
         })
 
     async def _run():
@@ -956,6 +1015,128 @@ def rssi_color(rssi):
     if rssi >= -70:
         return "yellow"
     return "red"
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  GATT SECURITY AUDIT                                           ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+# Known debug/developer service UUIDs
+_DEBUG_SERVICES = {
+    "00001530-0000-1000-8000-00805f9b34fb": "Nordic DFU Service",
+    "0000fe59-0000-1000-8000-00805f9b34fb": "Nordic DFU Service",
+    "0000fee0-0000-1000-8000-00805f9b34fb": "TI OAD Service",
+    "0000180a-0000-1000-8000-00805f9b34fb": "Device Information",
+    "0000180d-0000-1000-8000-00805f9b34fb": "Heart Rate",
+}
+
+# Known debug/developer characteristic UUIDs
+_DEBUG_CHARS = {
+    "00001531-0000-1000-8000-00805f9b34fb": "Nordic DFU Control Point",
+    "00001532-0000-1000-8000-00805f9b34fb": "Nordic DFU Packet",
+    "00001533-0000-1000-8000-00805f9b34fb": "Nordic DFU Revision",
+    "0000fe59-0000-1000-8000-00805f9b34fb": "TI OAD Characteristic",
+    "0000fee1-0000-1000-8000-00805f9b34fb": "TI OAD Image Block",
+    "00002a29-0000-1000-8000-00805f9b34fb": "Manufacturer Name",
+    "00002a25-0000-1000-8000-00805f9b34fb": "Serial Number",
+    "00002a24-0000-1000-8000-00805f9b34fb": "Model Number",
+    "00002a26-0000-1000-8000-00805f9b34fb": "Firmware Revision",
+    "00002a27-0000-1000-8000-00805f9b34fb": "Hardware Revision",
+    "00002a28-0000-1000-8000-00805f9b34fb": "Software Revision",
+}
+
+
+def audit_gatt_security(services_data):
+    """Audit GATT services for security concerns.
+
+    Args:
+        services_data: List of dicts with keys: uuid, name, chars (list of dicts with uuid, name, properties, value)
+
+    Returns:
+        Tuple of (findings, score) where findings is a list of (severity, text) tuples
+        and score is a letter grade: A, B, C, D, or F.
+    """
+    findings = []
+
+    for svc in services_data:
+        svc_uuid_lower = svc["uuid"].lower()
+        svc_name = svc.get("name", "") or ""
+
+        # Check for known debug services
+        if svc_uuid_lower in _DEBUG_SERVICES:
+            debug_name = _DEBUG_SERVICES[svc_uuid_lower]
+            if "dfu" in debug_name.lower() or "oad" in debug_name.lower():
+                findings.append(("critical", f"Debug/DFU service detected: {debug_name} ({svc['uuid']})"))
+            else:
+                findings.append(("info", f"Standard service: {debug_name} ({svc['uuid']})"))
+
+        # Check for Device Information service with exposed identifiers
+        if svc_uuid_lower == "0000180a-0000-1000-8000-00805f9b34fb":
+            for ch in svc.get("chars", []):
+                ch_uuid_lower = ch["uuid"].lower()
+                if ch_uuid_lower in ("00002a25-0000-1000-8000-00805f9b34fb",
+                                     "00002a23-0000-1000-8000-00805f9b34fb"):
+                    findings.append(("warning", f"Exposed device identifier: {ch.get('name', ch['uuid'])} in Device Information"))
+
+        # Check for Heart Rate service (health data)
+        if svc_uuid_lower == "0000180d-0000-1000-8000-00805f9b34fb":
+            findings.append(("info", "Heart Rate service detected — health data may be exposed"))
+
+        for ch in svc.get("chars", []):
+            props = ch.get("properties", [])
+            props_lower = [p.lower() for p in props]
+            ch_uuid_lower = ch["uuid"].lower()
+
+            # WRITE without authentication
+            if "write" in props_lower and "write-without-response" not in props_lower:
+                if "authenticated-w" not in props_lower and "authenticated-write" not in props_lower:
+                    findings.append(("warning",
+                        f"Characteristic {ch.get('name') or ch['uuid']} supports WRITE without authentication requirement"))
+
+            # WRITE-WITHOUT-RESPONSE (dangerous — no confirmation)
+            if "write-without-response" in props_lower:
+                findings.append(("warning",
+                    f"Characteristic {ch.get('name') or ch['uuid']} supports WRITE-WITHOUT-RESPONSE (no confirmation)"))
+
+            # NOTIFY/INDICATE without authentication
+            if ("notify" in props_lower or "indicate" in props_lower):
+                if "authenticated-r" not in props_lower and "authenticated-indicate" not in props_lower:
+                    # Only flag if it's not a standard well-known service
+                    if svc_uuid_lower not in (
+                        "0000180d-0000-1000-8000-00805f9b34fb",  # Heart Rate
+                        "0000180f-0000-1000-8000-00805f9b34fb",  # Battery
+                        "00001800-0000-1000-8000-00805f9b34fb",  # Generic Access
+                        "00001801-0000-1000-8000-00805f9b34fb",  # Generic Attribute
+                    ):
+                        findings.append(("info",
+                            f"Characteristic {ch.get('name') or ch['uuid']} has NOTIFY/INDICATE without authentication"))
+
+            # Known debug characteristics
+            if ch_uuid_lower in _DEBUG_CHARS:
+                debug_ch_name = _DEBUG_CHARS[ch_uuid_lower]
+                if "dfu" in debug_ch_name.lower() or "oad" in debug_ch_name.lower():
+                    findings.append(("critical", f"Debug characteristic: {debug_ch_name} ({ch['uuid']})"))
+                elif ch_uuid_lower in ("00002a25-0000-1000-8000-00805f9b34fb",
+                                        "00002a23-0000-1000-8000-00805f9b34fb"):
+                    findings.append(("warning", f"Exposed identifier: {debug_ch_name} ({ch['uuid']})"))
+
+    # Compute grade
+    critical_count = sum(1 for s, _ in findings if s == "critical")
+    warning_count = sum(1 for s, _ in findings if s == "warning")
+    info_count = sum(1 for s, _ in findings if s == "info")
+
+    if critical_count > 0:
+        score = "F"
+    elif warning_count >= 3:
+        score = "D"
+    elif warning_count >= 1:
+        score = "C"
+    elif info_count >= 2:
+        score = "B"
+    else:
+        score = "A"
+
+    return findings, score
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -1362,6 +1543,10 @@ def _build_tui():
             margin-top: 1;
             color: $text-muted;
         }
+        #rssi-graph {
+            height: 11;
+            margin-bottom: 0;
+        }
         """
 
         BINDINGS = [
@@ -1376,16 +1561,19 @@ def _build_tui():
             self._scanner = None
             self._prev_rssi = None
             self._rssi_history = []  # last 5 RSSI readings
+            self._graph_data = []  # (timestamp, rssi) for graph, max 120
             self._event_count = 0
             self._first_event_time = None
             self._last_event_time = None
             self._event_times = []  # timestamps for events/minute
+            self._spam_count = 0  # session spam event counter
 
         def compose(self) -> ComposeResult:
             from textual.containers import Vertical
             name = self.device.get("name") or self.device.get("apple_identity") or self.target_id[:12]
             with Vertical(id="log-container"):
                 yield Static(f"Action Log: {name}", id="log-title")
+                yield Static("Awaiting signal data...", id="rssi-graph")
                 yield Static("Waiting for advertisements...", id="log-stats")
                 yield Static("", id="log-entries")
                 yield Label("[dim]Esc to close | Watching for BLE events from this device[/dim]", id="log-hint")
@@ -1464,6 +1652,66 @@ def _build_tui():
             )
             stats_widget.update(stats)
 
+        def _build_rssi_graph(self):
+            """Build an ASCII bar chart of RSSI history."""
+            history = self._graph_data
+            if not history:
+                return "Awaiting signal data..."
+
+            rssi_min = -100
+            rssi_max = -30
+            rssi_range = rssi_max - rssi_min  # 70
+            graph_height = 8
+            max_cols = 80
+
+            readings = [rssi for _, rssi in history[-max_cols:]]
+            n = len(readings)
+            padding = max_cols - n
+
+            current_rssi = readings[-1]
+            zone = self._compute_zone(current_rssi)
+
+            zone_styles = {
+                "immediate": "bold green",
+                "near": "green",
+                "far": "yellow",
+                "remote": "red",
+                "unknown": "dim",
+            }
+            zone_style = zone_styles.get(zone, "dim")
+
+            header = f"Signal  \u25b2  {current_rssi} dBm  [{zone_style}]{zone}[/]"
+
+            lines = []
+            for row in range(graph_height):
+                threshold = rssi_min + rssi_range * (graph_height - row) / graph_height
+
+                line_parts = [" "] * padding
+                for rssi in readings:
+                    if rssi is not None and rssi >= threshold:
+                        if rssi > -50:
+                            line_parts.append("[green]\u2588[/green]")
+                        elif rssi > -70:
+                            line_parts.append("[yellow]\u2588[/yellow]")
+                        else:
+                            line_parts.append("[red]\u2588[/red]")
+                    else:
+                        line_parts.append(" ")
+                lines.append("".join(line_parts))
+
+            lines.append("\u2500" * max_cols)
+            lines.append("[green]\u2588[/] >-50  [yellow]\u2588[/] -50~-70  [red]\u2588[/] <-70")
+
+            return "\n".join([header] + lines)
+
+        def _update_graph(self):
+            """Update the RSSI graph widget."""
+            try:
+                widget = self.query_one("#rssi-graph")
+                widget.update(self._build_rssi_graph())
+            except Exception:
+                pass
+
         async def on_mount(self) -> None:
             self._start_scanning()
 
@@ -1496,6 +1744,12 @@ def _build_tui():
                         self._rssi_history.append(rssi)
                         if len(self._rssi_history) > 5:
                             self._rssi_history = self._rssi_history[-5:]
+
+                    # Track RSSI for graph
+                    if rssi is not None:
+                        self._graph_data.append((now, rssi))
+                        if len(self._graph_data) > 120:
+                            self._graph_data = self._graph_data[-120:]
 
                     # Decode Apple Continuity
                     apple_info = ""
@@ -1543,6 +1797,7 @@ def _build_tui():
                     self.log_entries.append(entry)
                     self._update_display()
                     self._update_stats()
+                    self._update_graph()
 
                 try:
                     self._scanner = BleakScanner(callback)
@@ -1614,6 +1869,7 @@ def _build_tui():
         BINDINGS = [
             Binding("escape", "close", "Close"),
             Binding("r", "read_char", "Read"),
+            Binding("a", "run_audit", "Audit"),
         ]
 
         def __init__(self, device_uuid, tracker=None):
@@ -1623,14 +1879,17 @@ def _build_tui():
             self._client = None
             self._services_data = []
             self._char_rows = {}  # row_key -> (service_uuid, char_uuid)
+            self._audit_findings = []
+            self._security_score = None
 
         def compose(self) -> ComposeResult:
             from textual.containers import Vertical
             with Vertical(id="gatt-container"):
                 yield Static(f"GATT: {self.device_uuid}", id="gatt-title")
                 yield Static("Connecting...", id="gatt-status")
+                yield Static("", id="gatt-audit-panel")
                 yield DataTable(id="gatt-table", cursor_type="row")
-                yield Label("[dim]r: read value | Esc: disconnect & close[/dim]", id="gatt-hint")
+                yield Label("[dim]r: read value | a: security audit | Esc: disconnect & close[/dim]", id="gatt-hint")
 
         async def on_mount(self) -> None:
             table = self.query_one("#gatt-table")
@@ -1715,11 +1974,56 @@ def _build_tui():
                 except Exception:
                     pass
 
+                # Run security audit automatically
+                self._run_audit_on_data()
+
             except Exception as e:
                 try:
                     self.query_one("#gatt-status").update(f"[red]Discovery error: {e}[/red]")
                 except Exception:
                     pass
+
+        def action_run_audit(self):
+            """Run security audit on-demand (binding 'a')."""
+            if not self._services_data:
+                try:
+                    self.query_one("#gatt-status").update("[yellow]No services discovered yet[/yellow]")
+                except Exception:
+                    pass
+                return
+            self._run_audit_on_data()
+
+        def _run_audit_on_data(self):
+            """Run the security audit on current services data and display results."""
+            self._audit_findings, self._security_score = audit_gatt_security(self._services_data)
+            self._display_audit_panel()
+
+        def _display_audit_panel(self):
+            """Update the audit panel widget with findings and score."""
+            try:
+                panel = self.query_one("#gatt-audit-panel")
+            except Exception:
+                return
+
+            if not self._audit_findings:
+                panel.update("[dim]Security Audit: No issues found (Score: A)[/dim]")
+                return
+
+            score = self._security_score or "A"
+            score_colors = {"A": "green", "B": "blue", "C": "yellow", "D": "red", "F": "bold red"}
+            score_color = score_colors.get(score, "dim")
+
+            lines = [f"[bold]Security Audit — Grade: [{score_color}]{score}[/][/bold]"]
+
+            for severity, text in self._audit_findings:
+                if severity == "critical":
+                    lines.append(f"  [bold red][CRITICAL][/bold red] {text}")
+                elif severity == "warning":
+                    lines.append(f"  [yellow][WARNING][/yellow] {text}")
+                else:
+                    lines.append(f"  [blue][INFO][/blue] {text}")
+
+            panel.update("\n".join(lines))
 
         def action_read_char(self):
             """Read the value of the selected characteristic."""
@@ -1848,6 +2152,8 @@ def _build_tui():
                         dev = self.tracker.get_by_id(self.device_uuid)
                         if dev:
                             dev["gatt_services"] = self._services_data
+                            if self._security_score:
+                                dev["gatt_security_score"] = self._security_score
                     await self._client.disconnect()
                 except Exception:
                     pass
@@ -2305,7 +2611,20 @@ def _build_tui():
                 identity = "paired"
             elif not identity and dev.get("connected"):
                 identity = "connected"
-            identity_cell = Text(identity, style=base if identity else "dim")
+
+            # Show security score if device has been GATT-audited
+            sec_score = dev.get("gatt_security_score")
+            if sec_score:
+                score_colors = {"A": "green", "B": "blue", "C": "yellow", "D": "red", "F": "bold red"}
+                sc = score_colors.get(sec_score, "dim")
+                sec_label = f" [/{sc}][dim]Sec:{sec_score}[/dim]"
+                if identity:
+                    identity = f"{identity}{sec_label}"
+                else:
+                    identity = f"Sec:{sec_score}"
+                identity_cell = Text.from_markup(identity) if "[" in identity else Text(identity, style=base if identity else "dim")
+            else:
+                identity_cell = Text(identity, style=base if identity else "dim")
 
             return [name_cell, vendor_cell, addr_cell, type_cell, signal_cell, identity_cell]
 
