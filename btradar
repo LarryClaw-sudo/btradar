@@ -1166,6 +1166,9 @@ class DeviceTracker:
                     existing["apple_identity"] = dev["apple_identity"]
                 if dev.get("apple_details"):
                     existing["apple_details"] = dev["apple_details"]
+                # Track spam signatures (accumulate across scans)
+                if dev.get("spam_signatures"):
+                    existing["spam_signatures"] = dev["spam_signatures"]
             else:
                 entry = dict(dev)
                 entry["first_seen"] = now
@@ -1809,7 +1812,7 @@ def _build_tui():
                     svc_str = f" Svc:[{','.join(services)}]" if services else ""
                     name_str = f' Name:"{name}"' if name else ""
 
-                    entry = f"[dim]{now_str}[/]  {rssi}dBm{rssi_delta}{zone_label}{apple_info}{svc_str}{name_str}"
+                    entry = f"[dim]{now_str}[/]  {rssi}dBm{rssi_delta}{zone_label}{apple_info}{spam_tag}{svc_str}{name_str}"
                     self.log_entries.append(entry)
                     self._update_display()
                     self._update_stats()
@@ -2338,6 +2341,8 @@ def _build_tui():
             self._scanning = False
             self._watched = set()
             self._watch_alerts = []  # list of alert messages
+            self._spam_devices = set()  # device IDs detected as spamming
+            self._spam_event_count = 0  # total spam events seen this session
 
         def compose(self) -> ComposeResult:
             yield Input(
@@ -2380,6 +2385,7 @@ def _build_tui():
             table.add_column("TYPE")
             table.add_column("SIGNAL")
             table.add_column("IDENTITY")
+            table.add_column("SPAM")
             table.focus()
             self._refresh_table()
             await self._run_scan()
@@ -2644,7 +2650,20 @@ def _build_tui():
             else:
                 identity_cell = Text(identity, style=base if identity else "dim")
 
-            return [name_cell, vendor_cell, addr_cell, type_cell, signal_cell, identity_cell]
+            # Spam indicator
+            spam_matches = dev.get("spam_signatures", [])
+            if spam_matches:
+                has_critical = any(sev == "critical" for _, sev in spam_matches)
+                if has_critical:
+                    spam_cell = Text("⚠ CRIT", style="bold red")
+                    name_cell = Text(name[:36], style="bold red")
+                else:
+                    spam_cell = Text("⚠ SPAM", style="bold yellow")
+                    name_cell = Text(name[:36], style="bold yellow")
+            else:
+                spam_cell = Text("", style="dim")
+
+            return [name_cell, vendor_cell, addr_cell, type_cell, signal_cell, identity_cell, spam_cell]
 
         def _refresh_table(self) -> None:
             table = self.query_one(DataTable)
