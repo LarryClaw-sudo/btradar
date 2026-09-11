@@ -1190,25 +1190,20 @@ def _build_tui():
             table = self.query_one(DataTable)
             if table.cursor_row is None:
                 return
-            try:
-                row_key = str(table.get_row_at(table.cursor_row))
-            except Exception:
-                return
-            # Try getting the key directly from the table
-            for rk in table.rows:
-                if table.cursor_row is not None and rk in [str(k) for k in table.rows.keys()]:
-                    device = self._tracker.get_by_id(rk)
-                    if device:
-                        self.push_screen(DeviceInspectScreen(device))
-                        return
-            # Fallback: try row index
-            rows = list(self._tracker.get_sorted())
+            # Build the same sorted/filtered list that populates the table
+            devices = self._tracker.get_sorted()
             if self._filter_text:
                 ft = self._filter_text.lower()
-                rows = [d for d in rows if ft in (d.get('name') or '').lower() or ft in (d.get('vendor') or '').lower() or ft in (d.get('apple_identity') or '').lower()]
+                devices = [
+                    d for d in devices
+                    if ft in (d.get("name") or "").lower()
+                    or ft in (d.get("vendor") or "").lower()
+                    or ft in (d.get("address") or "").lower()
+                    or ft in (d.get("apple_identity") or "").lower()
+                ]
             idx = table.cursor_row
-            if 0 <= idx < len(rows):
-                self.push_screen(DeviceInspectScreen(rows[idx]))
+            if 0 <= idx < len(devices):
+                self.push_screen(DeviceInspectScreen(devices[idx]))
 
         async def _run_scan(self) -> None:
             self._scanning = True
