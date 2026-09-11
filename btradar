@@ -1144,7 +1144,7 @@ def _build_tui():
 
         BINDINGS = [
             Binding("s", "scan", "Scan", show=True, priority=True),
-            Binding("enter", "inspect", "Inspect", show=True),
+            Binding("i", "inspect", "Inspect", show=True),
             Binding("slash", "toggle_filter", "Filter", show=True, priority=True),
             Binding("q", "quit", "Quit", show=True, priority=True),
         ]
