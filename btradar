@@ -1778,6 +1778,22 @@ def _build_tui():
                             parts.append(f"{tname}{detail}")
                         apple_info = " | Apple: " + ", ".join(parts)
 
+                    # Continuity Spam Detection
+                    spam_tag = ""
+                    if apple_payload:
+                        spam_matches = detect_continuity_spam(bytes(apple_payload))
+                        if spam_matches:
+                            self._spam_count += 1
+                            tags = []
+                            for sname, sev in spam_matches:
+                                if sev == "critical":
+                                    tags.append(f"[bold red][CRITICAL] {sname}[/]")
+                                elif sev == "warning":
+                                    tags.append(f"[bold yellow][SPAM] {sname}[/]")
+                                else:
+                                    tags.append(f"[yellow][SPAM] {sname}[/]")
+                            spam_tag = "  " + " ".join(tags)
+
                     # RSSI delta
                     rssi_delta = ""
                     if self._prev_rssi is not None:
@@ -2458,6 +2474,8 @@ def _build_tui():
                 # Include GATT services if read
                 if dev.get("gatt_services"):
                     export["device"]["gatt_services"] = dev["gatt_services"]
+                    if dev.get("gatt_security_score"):
+                        export["device"]["gatt_security_score"] = dev["gatt_security_score"]
                 # Include proximity zone history from DB
                 try:
                     zones = history_get_zone_history(dev["id"])
@@ -2773,13 +2791,23 @@ def _build_rich_row(dev):
     elif not identity and dev.get("connected"):
         identity = "connected"
 
+    # Show security score if device has been GATT-audited
+    sec_score = dev.get("gatt_security_score")
+    if sec_score:
+        score_colors = {"A": "green", "B": "blue", "C": "yellow", "D": "red", "F": "bold red"}
+        sc = score_colors.get(sec_score, "dim")
+        if identity:
+            identity = f"{identity} [/{sc}][dim]Sec:{sec_score}[/dim]"
+        else:
+            identity = f"Sec:{sec_score}"
+
     return {
         "NAME": Text(name, style=type_style),
         "VENDOR": Text(vendor_str, style=type_style),
         "ADDRESS": Text(addr, style=f"dim {type_style}"),
         "TYPE": Text(dtype, style=f"bold {type_style}"),
         "SIGNAL": signal,
-        "IDENTITY": Text(identity, style=type_style if identity else "dim"),
+        "IDENTITY": Text.from_markup(identity) if "[" in identity else Text(identity, style=type_style if identity else "dim"),
     }
 
 
