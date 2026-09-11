@@ -1608,6 +1608,9 @@ def main():
     scan_p.add_argument("--offline", action="store_true")
     scan_p.add_argument("--json", "-j", action="store_true")
 
+    # btradar update
+    sub.add_parser("update", help="Download and install the latest btradar")
+
     # btradar help [TOPIC]
     help_p = sub.add_parser("help", help="Show help topics or search for a keyword")
     help_p.add_argument("topic", nargs="?", default=None, help="Search for this keyword")
@@ -1635,6 +1638,23 @@ def main():
             search_help(args.topic)
         else:
             show_help_topics()
+        return
+
+    # Update
+    if args.command == "update":
+        import shutil
+        url = "https://raw.githubusercontent.com/LarryClaw-sudo/btradar/main/btradar"
+        target = os.path.abspath(sys.argv[0])
+        print(f"Downloading latest btradar from {url}...")
+        try:
+            import urllib.request
+            urllib.request.urlretrieve(url, target + ".new")
+            os.chmod(target + ".new", 0o755)
+            shutil.move(target + ".new", target)
+            print(f"Updated! Restart btradar to use the new version.")
+        except Exception as e:
+            print(f"Update failed: {e}")
+            print(f"You can also manually download from: {url}")
         return
 
     # Determine scan mode
