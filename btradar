@@ -1,0 +1,1678 @@
+#!/usr/bin/env python3
+"""
+btradar v2.0.0 — Interactive Bluetooth Scanner TUI for macOS.
+
+Merges classic BT scanning (blueutil), BLE scanning (bleak),
+Apple Continuity protocol decoding, OUI vendor lookup, and a Textual TUI
+into a single self-contained script.
+
+Usage:
+  btradar              # Interactive TUI (Textual framework)
+  btradar scan         # One-shot scan, print table, exit
+  btradar --json       # JSON output
+  btradar --lookup MAC # Resolve one address
+  btradar help         # Show help topics
+  btradar help TOPIC   # Search help for a keyword
+  btradar --version    # Print version
+  btradar --refresh-oui  # Re-download IEEE OUI vendor database
+  btradar -t N         # Scan duration (seconds)
+  btradar -b           # BLE only
+  btradar -c           # Classic BT only
+  btradar --offline    # Skip online vendor lookup fallback
+
+First run auto-creates a venv and installs bleak + rich + textual.
+"""
+
+__version__ = "2.0.1"
+
+import argparse
+import asyncio
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  AUTO-DEPS BOOTSTRAPPER                                         ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+VENV_DIR = os.path.expanduser("~/.btradar/venv")
+VENV_PY = os.path.join(VENV_DIR, "bin", "python3")
+SCRIPT_PATH = os.path.abspath(__file__)
+
+
+def _bootstrap_venv():
+    """Create venv, install deps, re-exec with venv python."""
+    if sys.prefix != sys.base_prefix:
+        return  # Already inside a venv
+
+    need_deps = False
+    for pkg in ("bleak", "rich", "textual"):
+        try:
+            __import__(pkg)
+        except ImportError:
+            need_deps = True
+            break
+
+    if not need_deps:
+        return
+
+    if not os.path.isfile(VENV_PY):
+        print("\U0001f4e6  Setting up btradar environment (first run)...")
+        subprocess.check_call([sys.executable, "-m", "venv", VENV_DIR])
+        subprocess.check_call(
+            [VENV_PY, "-m", "pip", "install", "--quiet", "bleak", "rich", "textual"]
+        )
+        print("\u2705  Environment ready. Starting btradar...\n")
+
+    os.execv(VENV_PY, [VENV_PY, SCRIPT_PATH] + sys.argv[1:])
+
+
+_bootstrap_venv()
+
+# From here on, bleak, rich, and textual are guaranteed importable.
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  EMBEDDED HELP REFERENCE                                        ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+HELP_TEXT = r"""TOOLS-REFERENCE — Bluetooth & Network Scanning on macOS
+========================================================
+Plain text reference. Search it: grep -i "how do i" TOOLS-REFERENCE.md
+Or: grep -i "airpods" TOOLS-REFERENCE.md
+Or: grep -iA5 "vendor" TOOLS-REFERENCE.md
+
+
+=== btradar ===
+Unified Bluetooth radar. Classic BT + BLE + Apple Continuity in one tool.
+Replaces btwho + btapple. Interactive TUI mode by default.
+
+Install:
+  curl or download the btradar script
+  cp btradar /opt/homebrew/bin/btradar
+  chmod +x /opt/homebrew/bin/btradar
+  btradar          # first run auto-installs bleak + rich + textual into ~/.btradar/venv/
+
+First run downloads the IEEE OUI vendor database (~6MB) to ~/.cache/btwho/oui.txt.
+
+Commands:
+  btradar                  # interactive TUI (Textual framework)
+  btradar scan             # one-shot scan, print table, exit
+  btradar scan -t 20       # scan for 20 seconds
+  btradar scan -b          # BLE only
+  btradar scan -c          # Classic only
+  btradar --json           # JSON output (pipe into jq)
+  btradar --lookup AA:BB:CC:DD:EE:FF    # resolve one MAC address
+  btradar --version        # print version
+  btradar --refresh-oui    # re-download vendor database
+  btradar --offline        # skip online vendor lookup (use local db only)
+  btradar help             # show help topics
+  btradar help airpods     # search help for "airpods"
+
+TUI controls:
+  s                        # trigger a new scan
+  Enter                    # inspect selected device (detail view)
+  /                        # toggle filter input (type to filter)
+  Esc                      # close filter or detail view
+  q                        # quit
+  Up/Down arrows           # navigate table
+
+Output columns:
+  Name       — advertised device name (Apple devices often show nothing here)
+  Vendor     — manufacturer decoded from MAC prefix (Apple, Bose, Samsung...)
+  Address    — MAC address or BLE UUID. "(random)" = address rotates
+  Type       — Classic BT or BLE
+  Signal     — RSSI in dBm + visual bar
+  Identity   — what the device is doing (Handoff, AirDrop, AirPods battery, etc.)
+
+Apple devices: btradar decodes Apple Continuity frames (company 0x4C) to tell you
+what type of Apple device it is and what it's doing, even though it hides its name.
+You'll see: "Handoff + Nearby" (likely a MacBook), "AirDrop" (likely iPhone/iPad),
+"AirPods battery left=42% case=80%", "AirTag / Find My".
+
+Note: macOS hides real BLE MAC addresses (gives a per-Mac UUID instead).
+BLE vendor column shows "n/a (macOS hides MAC)" — this is an OS restriction.
+Classic BT (blueutil) shows real MAC addresses.
+
+Dependencies auto-installed: bleak, rich, textual (into ~/.btradar/venv/).
+To reinstall: rm -rf ~/.btradar/venv && btradar
+
+
+=== blew ===
+BLE scanner + GATT tool + virtual peripheral + MCP server for macOS.
+The best dedicated BLE tool. Shows device names, service names, RSSI bars.
+
+Install:
+  brew install stass/tap/blew
+  First run asks for Bluetooth permission (System Settings > Privacy > Bluetooth)
+
+Scan for devices:
+  blew scan                # 5-second scan
+  blew scan -w             # live watch mode (Ctrl+C to stop)
+  blew scan -w -R -70      # watch, only show devices with RSSI >= -70 dBm
+  blew scan -n "Sensor"    # filter by name
+  blew scan -S 180D        # filter by service UUID (Heart Rate)
+  blew scan -S 180A        # filter by Device Information service
+
+Read device info (connects automatically):
+  blew -n "Thingy" gatt tree              # full service tree
+  blew -n "Thingy" gatt tree -r           # tree with values read
+  blew -n "Thingy" gatt chars -r 180A     # read Device Information
+  blew -i <UUID> gatt chars -r 180A       # target by BLE UUID from scan
+
+Subscribe to live data:
+  blew -n "Sensor" sub -d 60 fff1         # subscribe for 60 seconds
+  blew -o kv sub -n "Sensor" fff1 >> log  # machine-readable to file
+
+Look up a characteristic spec (no device needed):
+  blew gatt info 2A37                      # Heart Rate Measurement spec
+
+Virtual peripheral (make your Mac advertise as a fake device):
+  blew periph clone -n "Heart Rate Monitor" --save hr.json
+  blew periph adv --config hr.json
+  blew periph notify                       # push a value update
+
+MCP server (for AI agents):
+  blew mcp                                 # expose BLE ops as MCP tools
+
+Scriptable output:
+  blew -o kv scan                          # key=value, one record per line
+  blew exec "connect -n X; gatt tree"      # chain commands
+
+Note: BLE device IDs are UUIDs on macOS, not real MAC addresses.
+This is a CoreBluetooth limitation, not blew.
+
+
+=== blueutil ===
+Control your Mac's Bluetooth: power, pairing, connections, scanning, proximity triggers.
+
+Install:
+  brew install blueutil
+
+Power:
+  blueutil -p                   # is Bluetooth on? (1=on, 0=off)
+  blueutil -p 1                 # turn on
+  blueutil -p 0                 # turn off
+  blueutil -p toggle            # toggle
+
+Devices:
+  blueutil --paired             # list paired devices
+  blueutil --connected          # list connected devices
+  blueutil --inquiry            # scan nearby (10s default)
+  blueutil --inquiry 20         # scan for 20 seconds
+  blueutil --inquiry --format json-pretty    # JSON output
+
+Connect / disconnect:
+  blueutil --connect "AirPods"         # connect by name
+  blueutil --connect 00-0A-95-3B-95-65 # connect by address
+  blueutil --disconnect "AirPods"
+  blueutil --pair "Device Name" 0000    # pair with PIN
+
+Device info:
+  blueutil --info "AirPods"             # detailed info
+
+Proximity triggers (scriptable):
+  blueutil --wait-rssi "AirPods" gt -60 5     # wait until RSSI > -60 (close)
+  blueutil --wait-connect "iPhone" 30         # wait up to 30s for connect
+  blueutil --wait-disconnect "iPhone" 30      # wait for disconnect
+
+Combine with shell scripts for automation:
+  blueutil --wait-connect "AirPods" && open -a Spotify
+
+Note: blueutil uses private IOBluetooth APIs. Don't open Bluetooth prefs while
+running (it toggles discoverability). Won't run as root without BLUEUTIL_ALLOW_ROOT=1.
+
+Output format: --format can be default, new-default, json, json-pretty.
+
+
+=== btwho ===
+Legacy tool. Combined Classic BT + BLE scan with OUI vendor lookup.
+Replaced by btradar (which does everything btwho does, plus more).
+
+Install:
+  cp btwho /opt/homebrew/bin/btwho
+  chmod +x /opt/homebrew/bin/btwho
+
+Commands:
+  btwho                  # full scan (Classic + BLE)
+  btwho -c               # Classic only (real MAC addresses)
+  btwho -b               # BLE only
+  btwho -t 20            # scan for 20 seconds
+  btwho -j               # JSON output
+  btwho --lookup MAC     # resolve one address to vendor
+  btwho --offline        # skip online lookup
+  btwho --refresh-oui    # re-download vendor database
+
+No Python dependencies (pure stdlib).
+
+
+=== btapple ===
+Legacy tool. Apple Continuity decoder via bleak.
+Replaced by btradar (which does everything btapple does, plus more).
+
+Install:
+  pip3 install --user --break-system-packages bleak
+  cp btapple /opt/homebrew/bin/btapple
+  chmod +x /opt/homebrew/bin/btapple
+
+Commands:
+  btapple -t 20          # scan and decode Apple Continuity frames
+  btapple -t 30 --json   # JSON output
+  btapple --file HEX     # decode a raw hex frame (no Bluetooth needed)
+
+Decodes: AirDrop, Handoff, Nearby Action, AirPlay, Find My, AirTag,
+iBeacon (UUID/major/minor/tx), AirPods battery.
+
+
+=== arp-scan ===
+Network scanner. Lists every device on your WiFi/LAN with IP + MAC + vendor.
+NOT Bluetooth — this is for IP-connected devices (phones, laptops, TVs, etc).
+
+Install:
+  brew install arp-scan
+
+Scan your network:
+  sudo arp-scan --localnet           # scan all IPs on your subnet
+  sudo arp-scan -I en0 --localnet    # force WiFi interface (en0 on Mac)
+
+Output: IP address, MAC address, vendor name.
+Combine with btradar for full picture:
+  arp-scan shows who's on your WiFi (with IPs)
+  btradar shows who's in the air (Bluetooth radio)
+
+Note: needs sudo. If scan hangs, try -I en0 explicitly.
+
+
+=== bluehood ===
+Background Bluetooth presence tracker with web dashboard.
+Tracks devices over time, shows heatmaps, patterns, dwell time.
+
+Install:
+  git clone https://github.com/dannymcc/bluehood.git
+  cd bluehood
+  python3 -m pip install -e .
+
+Run:
+  python3 -m bluehood.daemon        # starts daemon + web UI on localhost:8080
+  First run asks for Bluetooth permission.
+
+Features:
+  - Device classification (phones, audio, wearables, IoT)
+  - 30-day presence timeline
+  - Hourly/daily activity heatmaps
+  - RSSI history with proximity zones
+  - Watch specific devices, get alerts on appear/leave
+  - Screenshot mode (obfuscate MACs for sharing)
+
+Web dashboard: http://localhost:8080
+
+Note: always-on daemon. Use bluehood for long-term presence tracking.
+Use btradar for quick scans and real-time views.
+
+
+=== QUICK REFERENCE BY TASK ===
+
+Scan for nearby Bluetooth devices:
+  btradar scan                    # best: merged view with vendor names
+  blew scan -w                    # BLE only, live updating
+  blueutil --inquiry 15           # Classic only, real MACs
+
+Find what a specific MAC address is:
+  btradar --lookup AA:BB:CC:DD:EE:FF
+
+See Apple device identity (what type, what it's doing):
+  btradar scan                    # decodes Continuity frames automatically
+
+Read device info from a specific BLE device:
+  blew scan                       # find the device name or UUID
+  blew -n "Name" gatt chars -r 180A    # read model info
+
+Monitor sensor data from a BLE device:
+  blew -n "Sensor" sub -d 60 fff1      # subscribe for 60s
+  blew -o kv sub -n "Sensor" fff1 >> log.csv   # to file
+
+See who's on your WiFi network:
+  sudo arp-scan --localnet
+
+Make your Mac pretend to be a BLE device:
+  blew periph clone -n "Heart Rate" --save hr.json
+  blew periph adv --config hr.json
+
+Bluetooth proximity trigger (no app needed):
+  blueutil --wait-rssi "AirPods" gt -60 5  # when you're close
+  blueutil --wait-connect "iPhone" && say "welcome home"
+
+Track who's been in a room over time:
+  python3 -m bluehood.daemon       # web dashboard at localhost:8080
+
+Decode a raw Apple BLE frame:
+  btapple --file 4c001003070001    # pass hex string
+
+Combined network + Bluetooth audit:
+  sudo arp-scan --localnet         # IP layer
+  btradar scan                     # radio layer
+
+
+=== COMMON PITFALLS ===
+
+Apple devices show no name in BLE scan.
+  This is by design. Apple hides names behind Continuity protocol.
+  Use btradar or btapple to decode what they're actually doing.
+  You can also read their model string: blew -i <UUID> gatt chars -r 180A
+
+"Permission denied" copying to /usr/local/bin on Apple Silicon Mac.
+  /usr/local/bin is root-owned on arm64. Use /opt/homebrew/bin instead.
+  cp tool /opt/homebrew/bin/ && chmod +x /opt/homebrew/bin/tool
+
+pip install fails with "externally-managed-environment".
+  Use: pip3 install --user --break-system-packages PACKAGE
+  Or create a venv: python3 -m venv ~/.venvs/name
+
+BLE device shows "n/a (macOS hides MAC)" for vendor.
+  This is normal. macOS CoreBluetooth doesn't expose BLE MAC addresses.
+  The UUID shown is a per-scan identifier, not a real MAC.
+  Use blueutil --inquiry for Classic BT devices (those show real MACs).
+
+Bluetooth scan finds nothing.
+  Make sure Bluetooth is on: blueutil -p
+  Grant Bluetooth permission to Terminal in System Settings > Privacy > Bluetooth
+  Apple devices advertise in bursts — try a longer scan (-t 30)
+
+blew shows "Error: no devices found" when targeting a device.
+  You need the actual name or UUID from a scan first.
+  blew scan          # get names/IDs
+  blew -n "Actual Name" gatt chars -r 180A
+
+rich / bleak / textual import errors.
+  btradar auto-installs these into ~/.btradar/venv/ on first run.
+  If it fails: rm -rf ~/.btradar/venv && btradar
+  Or manually: pip3 install --user --break-system-packages bleak rich textual
+
+Randomized MAC addresses "(random)" everywhere.
+  Modern phones and watches rotate their MAC every ~15 minutes.
+  This is a privacy feature. btradar flags these automatically.
+  Within one scan session, the UUID is stable (useful for tracking).
+  Across sessions, there's no reliable way to re-identify a randomized device.
+
+File was sent as a document and won't run.
+  Files from Telegram arrive without execute permission.
+  After copying: chmod +x /path/to/tool
+  And make sure there's no extension (e.g. "btwho" not "btwho.py")
+"""
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  HELP SYSTEM                                                    ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+def _parse_sections(text):
+    """Split HELP_TEXT into [(section_name, content)] at === delimiters."""
+    sections = []
+    current_name = None
+    current_lines = []
+    for line in text.splitlines(keepends=True):
+        if line.startswith("=== ") and line.rstrip().endswith(" ==="):
+            if current_name is not None:
+                sections.append((current_name, "".join(current_lines)))
+            current_name = line.strip().strip("=").strip()
+            current_lines = []
+        else:
+            current_lines.append(line)
+    if current_name is not None:
+        sections.append((current_name, "".join(current_lines)))
+    return sections
+
+
+def show_help_topics():
+    """Render a rich table of help topics."""
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+    sections = _parse_sections(HELP_TEXT)
+
+    table = Table(
+        title="[bold bright_white]\U0001f4e1  btradar help \u2014 topic index[/]",
+        show_lines=True,
+        pad_edge=True,
+        padding=(0, 1),
+        border_style="dim",
+    )
+    table.add_column("TOPIC", style="bold cyan", min_width=22)
+    table.add_column("DESCRIPTION", style="", min_width=40)
+
+    descriptions = {
+        "btradar": "Unified Bluetooth radar. Classic BT + BLE + Apple Continuity.",
+        "blew": "BLE scanner + GATT tool + virtual peripheral + MCP server.",
+        "blueutil": "Control Mac Bluetooth: power, pairing, connections, scanning.",
+        "btwho": "Legacy Classic BT + BLE scan with OUI vendor lookup.",
+        "btapple": "Legacy Apple Continuity decoder via bleak.",
+        "arp-scan": "Network scanner. IP + MAC + vendor on your WiFi/LAN.",
+        "bluehood": "Background Bluetooth presence tracker with web dashboard.",
+        "QUICK REFERENCE BY TASK": "One-liner recipes for common scanning tasks.",
+        "COMMON PITFALLS": "Troubleshooting: permissions, empty scans, import errors.",
+    }
+
+    for name, _ in sections:
+        desc = descriptions.get(name, "")
+        table.add_row(name, desc)
+
+    console.print(table)
+    console.print(
+        "[dim]  Usage: btradar help TOPIC   (e.g. btradar help airpods)[/]"
+    )
+
+
+def search_help(topic):
+    """Search HELP_TEXT for TOPIC and print matching sections with context."""
+    from rich.console import Console
+
+    console = Console()
+    sections = _parse_sections(HELP_TEXT)
+    topic_lower = topic.lower()
+    matches = []
+
+    for name, content in sections:
+        lines = content.splitlines()
+        matched_line_indices = set()
+        for i, line in enumerate(lines):
+            if topic_lower in line.lower():
+                matched_line_indices.add(i)
+
+        if matched_line_indices:
+            matches.append((name, lines, matched_line_indices))
+
+    if not matches:
+        console.print(f"[dim]No results for '[bold]{topic}[/bold]' in help.[/dim]")
+        console.print("[dim]Try: btradar help  (to see all topics)[/dim]")
+        return
+
+    for name, lines, matched_indices in matches:
+        console.print(f"\n[bold cyan]\u2550\u2550\u2550 {name} \u2550\u2550\u2550[/bold cyan]")
+
+        shown = set()
+        for idx in sorted(matched_indices):
+            start = max(0, idx - 3)
+            end = min(len(lines), idx + 4)
+            for i in range(start, end):
+                shown.add(i)
+
+        prev = -1
+        for i in sorted(shown):
+            if i > prev + 1 and prev >= 0:
+                console.print("[dim]  ...[/dim]")
+            line = lines[i].rstrip()
+            if i in matched_indices:
+                console.print(f"  [bold yellow]>[/] {line}")
+            else:
+                console.print(f"    {line}")
+            prev = i
+
+    console.print(
+        f"\n[dim]  Found {sum(len(mi) for _, _, mi in matches)} match(es) "
+        f"in {len(matches)} section(s).[/]"
+    )
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  OUI VENDOR LOOKUP (from btwho)                                ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+CACHE_DIR = os.path.expanduser("~/.cache/btwho")
+OUI_FILE = os.path.join(CACHE_DIR, "oui.txt")
+OUI_URL = "https://standards-oui.ieee.org/oui/oui.txt"
+MAC_LOOKUP_API = "https://api.maclookup.app/v2/macs/"
+
+_oui_db = None
+
+
+def load_oui(refresh=False):
+    """Parse the IEEE MA-L registry into {PREFIX: vendor}."""
+    global _oui_db
+    if _oui_db is not None:
+        return _oui_db
+    if refresh and os.path.exists(OUI_FILE):
+        os.remove(OUI_FILE)
+    if not os.path.exists(OUI_FILE):
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            print("  \u2b07  Downloading IEEE OUI registry (~6 MB, once)...",
+                  file=sys.stderr)
+            urllib.request.urlretrieve(OUI_URL, OUI_FILE)
+        except Exception as e:
+            print(f"  \u26a0  OUI download failed ({e}); using online fallback only",
+                  file=sys.stderr)
+            _oui_db = {}
+            return _oui_db
+    _oui_db = {}
+    rx = re.compile(
+        r"^([0-9A-F]{2})-([0-9A-F]{2})-([0-9A-F]{2})\s+\(hex\)\s+(.+?)\s*$"
+    )
+    with open(OUI_FILE, "r", errors="ignore") as fh:
+        for line in fh:
+            m = rx.match(line)
+            if m:
+                _oui_db[m.group(1) + m.group(2) + m.group(3)] = m.group(4)
+    return _oui_db
+
+
+def norm_addr(addr):
+    """Normalize MAC: AA-BB-CC-DD-EE-FF / AA:BB:.. / AABBCC.. -> AABBCCDDEEFF"""
+    return re.sub(r"[^0-9A-Fa-f]", "", addr).upper()
+
+
+def is_real_mac(addr):
+    """True if the address is a real 48-bit MAC."""
+    return len(norm_addr(addr)) == 12
+
+
+def is_randomized(addr):
+    """Locally-administered bit set => randomized / private address."""
+    hexs = norm_addr(addr)
+    if len(hexs) != 12:
+        return False
+    return bool(int(hexs[0:2], 16) & 0x02)
+
+
+def vendor_lookup(addr, online=True):
+    """Resolve MAC prefix to vendor name."""
+    hexs = norm_addr(addr)
+    if len(hexs) < 6:
+        return None
+    prefix = hexs[:6]
+    v = load_oui().get(prefix)
+    if v:
+        return v
+    if not online:
+        return None
+    try:
+        with urllib.request.urlopen(MAC_LOOKUP_API + hexs[:12], timeout=6) as r:
+            j = json.loads(r.read().decode())
+        if j.get("found"):
+            return j.get("company")
+    except Exception:
+        pass
+    return None
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  APPLE CONTINUITY DECODER (from btapple)                       ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+APPLE_COMPANY_ID = 0x004C
+
+APPLE_TYPES = {
+    0x01: "iBeacon (off)",
+    0x02: "iBeacon",
+    0x05: "AirDrop",
+    0x07: "AirPods / Proximity Pairing",
+    0x08: "Hey Siri",
+    0x09: "AirPlay Target",
+    0x0A: "AirPlay Source",
+    0x0B: "MagSafe",
+    0x0C: "Handoff",
+    0x0D: "Wi-Fi Settings",
+    0x0E: "HomeKit (encrypted)",
+    0x0F: "Proximity Pairing / Wi-Fi Join",
+    0x10: "Nearby Action",
+    0x12: "Find My / Nearby",
+    0x13: "Instant Hotspot",
+    0x15: "AirPrint",
+    0x16: "HomeKit Encryption",
+    0x19: "AirTag / Find My",
+    0x1C: "Location Sharing",
+}
+
+NEARBY_ACTION = {
+    0x01: "iOS recently updated",
+    0x03: "Locked screen",
+    0x07: "Transition phase",
+    0x0A: "Locked + Apple Watch",
+    0x0B: "Active user",
+    0x0E: "Phone call / FaceTime",
+}
+
+
+def parse_apple_tlvs(data):
+    """Parse Apple manufacturer payload into [(type, bytes)] TLVs."""
+    out, i = [], 0
+    n = len(data)
+    while i + 1 < n:
+        t, ln = data[i], data[i + 1]
+        if ln == 0 or i + 2 + ln > n:
+            out.append((t, data[i + 2:i + 2 + min(ln, max(0, n - i - 2))]))
+            break
+        out.append((t, bytes(data[i + 2:i + 2 + ln])))
+        i += 2 + ln
+    return out
+
+
+def battery_nibble(nib):
+    """0..14 -> percentage string, 0 -> None, 15 -> charging."""
+    if nib == 0:
+        return None
+    if nib == 15:
+        return "100% (charging)"
+    return f"{nib * 100 // 14}%"
+
+
+def decode_airpods_battery(payload):
+    """AirPods proximity-pairing frame: left/right/case battery nibbles."""
+    if len(payload) < 3:
+        return {}
+    b = payload[:8]
+    hi = [x >> 4 for x in b]
+    lo = [x & 0x0F for x in b]
+    left = battery_nibble(hi[0]) if hi[0] else (battery_nibble(lo[0]) if lo[0] else None)
+    right = battery_nibble(lo[1]) if len(b) > 1 and lo[1] else None
+    case = battery_nibble(lo[2]) if len(b) > 2 and lo[2] else None
+    out = {}
+    if left:
+        out["left"] = left
+    if right:
+        out["right"] = right
+    if case:
+        out["case"] = case
+    return out
+
+
+def decode_apple_identity(manufacturer_data):
+    """Decode Apple Continuity manufacturer_data into human-readable identity lines.
+
+    Args:
+        manufacturer_data: dict[int, bytes] from AdvertisementData
+    Returns:
+        (primary_label, detail_lines) tuple
+    """
+    apple_payload = manufacturer_data.get(APPLE_COMPANY_ID)
+    if apple_payload is None:
+        return None, []
+
+    tlvs = parse_apple_tlvs(bytes(apple_payload))
+    identity_parts = []
+    detail_lines = []
+
+    for t, payload in tlvs:
+        name = APPLE_TYPES.get(t, f"Continuity 0x{t:02X}")
+        detail = ""
+
+        if t == 0x02 and len(payload) >= 21:
+            u = payload[:16].hex()
+            maj = int.from_bytes(payload[16:18], "big")
+            mnr = int.from_bytes(payload[18:20], "big")
+            txb = payload[20]
+            tx = txb - 256 if txb > 127 else txb
+            detail = f" UUID={u[:8]}...{u[-4:]} major={maj} minor={mnr} tx={tx:+d}dBm"
+            identity_parts.append(name)
+
+        elif t == 0x05 and len(payload) >= 1:
+            detail = f" ({len(payload)} bytes, hashed Apple ID)"
+            identity_parts.append("AirDrop")
+
+        elif t == 0x10 and len(payload) >= 1:
+            code = payload[0] & 0x0F
+            sharing = payload[0] >> 4
+            action_str = NEARBY_ACTION.get(code, f"code=0x{code:X}")
+            detail = f" action={action_str} locationSharing={'on' if sharing else 'off'}"
+            identity_parts.append("Nearby")
+
+        elif t in (0x07, 0x0F):
+            bat = decode_airpods_battery(payload)
+            if bat:
+                bat_str = ", ".join(f"{k}={v}" for k, v in bat.items())
+                detail = f" battery={bat_str}"
+                identity_parts.append("AirPods")
+            else:
+                detail = " (pairing frame)"
+                identity_parts.append("Proximity Pairing")
+
+        elif t in (0x19, 0x12):
+            detail = " (Find My network beacon)"
+            identity_parts.append("Find My / AirTag")
+
+        elif t == 0x0C:
+            identity_parts.append("Handoff")
+        elif t == 0x09:
+            identity_parts.append("AirPlay Target")
+        elif t == 0x0B:
+            identity_parts.append("MagSafe")
+        elif t == 0x08:
+            identity_parts.append("Hey Siri")
+
+        detail_lines.append((APPLE_TYPES.get(t, f"0x{t:02X}"), detail.strip()))
+
+    primary = " + ".join(identity_parts) if identity_parts else "Apple device"
+    return primary, detail_lines
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  CLASSIC BT SCANNER (blueutil)                                 ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+def _have(cmd):
+    return subprocess.call(
+        ["which", cmd], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    ) == 0
+
+
+def _run_cmd(cmd, timeout):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.stdout
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired as e:
+        return (e.stdout or "") if isinstance(e.stdout, str) else ""
+    except Exception:
+        return None
+
+
+def scan_classic(seconds):
+    """blueutil --inquiry: real MAC addresses + names (Classic BT)."""
+    if not _have("blueutil"):
+        return None
+    out = _run_cmd(["blueutil", "--inquiry", str(seconds), "--format", "json"],
+                   seconds + 25)
+    if out is None:
+        return None
+    try:
+        devs = json.loads(out[out.index("["):])
+    except Exception:
+        return []
+    results = []
+    for d in devs:
+        addr = d.get("address", "")
+        name_raw = d.get("name") or ""
+        name = re.sub(r"\x1b\[[0-9;]*m", "", name_raw).strip()
+        results.append({
+            "id": norm_addr(addr),
+            "name": name,
+            "address": addr,
+            "type": "Classic",
+            "rssi": None,
+            "vendor": vendor_lookup(addr),
+            "random": is_randomized(addr),
+            "paired": bool(d.get("paired")),
+            "connected": bool(d.get("connected")),
+            "apple_identity": None,
+            "apple_details": [],
+        })
+    return results
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  BLE + APPLE SCANNER (bleak)                                   ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+def scan_ble(seconds):
+    """Bleak BLE scanner: all BLE devices, with Apple Continuity decode."""
+    import asyncio
+    from bleak import BleakScanner
+
+    found = []
+
+    def callback(device, advertisement_data):
+        md = advertisement_data.manufacturer_data
+        rssi = advertisement_data.rssi
+        name = device.name or ""
+        addr = device.address
+        is_apple = APPLE_COMPANY_ID in md
+
+        apple_id = None
+        apple_det = []
+        if is_apple:
+            apple_id, apple_det = decode_apple_identity(md)
+
+        found.append({
+            "id": addr,
+            "name": name,
+            "address": addr,
+            "type": "Apple" if is_apple else "BLE",
+            "rssi": rssi,
+            "vendor": None,
+            "random": False,
+            "paired": False,
+            "connected": False,
+            "apple_identity": apple_id,
+            "apple_details": apple_det,
+        })
+
+    async def _run():
+        try:
+            scanner = BleakScanner(callback)
+        except Exception:
+            scanner = BleakScanner(callback, cb={})
+        await scanner.start()
+        await asyncio.sleep(seconds)
+        await scanner.stop()
+
+    asyncio.run(_run())
+    return found
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  BLUETOOTH AVAILABILITY CHECK                                   ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+def check_bluetooth_available():
+    """Check if Bluetooth hardware/permission is available on macOS.
+    Returns (available: bool, message: str).
+    """
+    if sys.platform != "darwin":
+        return True, ""  # Not macOS, skip check
+
+    if _have("blueutil"):
+        out = _run_cmd(["blueutil", "-p"], 5)
+        if out is not None:
+            val = out.strip()
+            if val == "0":
+                return False, "Bluetooth is OFF. Turn it on: blueutil -p 1"
+            return True, ""
+
+    try:
+        import asyncio
+        from bleak import BleakScanner
+
+        async def _quick_check():
+            try:
+                scanner = BleakScanner()
+                await scanner.start()
+                await asyncio.sleep(0.5)
+                await scanner.stop()
+                return True, ""
+            except Exception as e:
+                err = str(e)
+                if "permission" in err.lower() or "CBATTErrorDomain" in err.lower():
+                    return False, (
+                        "Bluetooth permission denied. "
+                        "Grant access: System Settings > Privacy > Bluetooth > Terminal"
+                    )
+                if "power" in err.lower() or "off" in err.lower():
+                    return False, "Bluetooth may be OFF or unavailable."
+                return True, ""
+
+        return asyncio.run(_quick_check())
+    except ImportError:
+        pass
+
+    return True, ""
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  UNIFIED SCANNER                                                ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+def do_scan(classic_sec, ble_sec, classic_only=False, ble_only=False):
+    """Run both scanners (or one), merge results, deduplicate."""
+    devices = {}
+
+    if not ble_only:
+        classic = scan_classic(classic_sec)
+        if classic is None:
+            print("  \u2139  blueutil not found \u2014 skipping Classic BT "
+                  "(brew install blueutil)", file=sys.stderr)
+        else:
+            for d in classic:
+                devices[d["id"]] = d
+
+    if not classic_only:
+        try:
+            ble = scan_ble(ble_sec)
+        except ImportError:
+            print("  \u2139  bleak not found \u2014 skipping BLE "
+                  "(should have been auto-installed)", file=sys.stderr)
+            ble = []
+        for d in ble:
+            if d["id"] not in devices:
+                devices[d["id"]] = d
+
+    return list(devices.values())
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  SIGNAL FORMATTING                                              ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+def signal_bar(rssi, width=10):
+    """RSSI -> visual bar: \u2588\u2588\u2588\u2588\u2591\u2591\u2591\u2591\u2591\u2591 style."""
+    if rssi is None:
+        return "\u2591" * width
+    bars = max(0, min(width, int((rssi + 100) / (100 / width))))
+    filled = "\u2588" * bars
+    empty = "\u2591" * (width - bars)
+    return f"{filled}{empty}"
+
+
+def rssi_color(rssi):
+    """Color string based on signal strength."""
+    if rssi is None:
+        return "dim"
+    if rssi >= -50:
+        return "green"
+    if rssi >= -70:
+        return "yellow"
+    return "red"
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  DEVICE TRACKER                                                ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+class DeviceTracker:
+    """Tracks all seen devices across scan cycles within a session."""
+
+    def __init__(self):
+        self.devices = {}  # keyed by stable_id
+
+    def update(self, scan_results):
+        """Update tracker with new scan results."""
+        now = datetime.now()
+        for dev in scan_results:
+            sid = dev["id"]
+            if sid in self.devices:
+                existing = self.devices[sid]
+                existing["rssi"] = dev["rssi"]
+                existing["last_seen"] = now
+                if dev["name"]:
+                    existing["name"] = dev["name"]
+                if dev.get("vendor"):
+                    existing["vendor"] = dev["vendor"]
+                if dev.get("apple_identity"):
+                    existing["apple_identity"] = dev["apple_identity"]
+                if dev.get("apple_details"):
+                    existing["apple_details"] = dev["apple_details"]
+            else:
+                entry = dict(dev)
+                entry["first_seen"] = now
+                entry["last_seen"] = now
+                self.devices[sid] = entry
+
+    def get_sorted(self):
+        """Return devices sorted by RSSI (strongest first)."""
+        return sorted(
+            self.devices.values(),
+            key=lambda d: d["rssi"] if d["rssi"] is not None else -999,
+            reverse=True,
+        )
+
+    def get_by_id(self, stable_id):
+        return self.devices.get(stable_id)
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  TEXTUAL TUI (lazy-loaded)                                     ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+
+def _build_tui():
+    """Import textual and build the TUI classes. Only called when TUI mode is needed."""
+    from textual.app import App, ComposeResult
+    from textual.binding import Binding
+    from textual.screen import ModalScreen
+    from textual.widgets import DataTable, Input, Label, Static
+    from textual import events
+    from rich.text import Text
+
+
+    class DeviceInspectScreen(ModalScreen):
+        """Modal screen showing full device detail."""
+
+        CSS = """
+        DeviceInspectScreen {
+            align: center middle;
+        }
+        #inspect-container {
+            width: 82;
+            max-height: 85%;
+            border: thick $primary;
+            background: $surface;
+            padding: 1 2;
+        }
+        #inspect-title {
+            text-style: bold;
+            text-align: center;
+            margin-bottom: 1;
+            color: $accent;
+        }
+        #inspect-content {
+            height: auto;
+        }
+        #inspect-hint {
+            text-align: center;
+            margin-top: 1;
+            color: $text-muted;
+        }
+        """
+
+        BINDINGS = [
+            Binding("escape", "close", "Close"),
+        ]
+
+        def __init__(self, device):
+            super().__init__()
+            self.device = device
+
+        def compose(self) -> ComposeResult:
+            d = self.device
+            from textual.containers import Vertical
+
+            content = self._build_content(d)
+
+            with Vertical(id="inspect-container"):
+                yield Static("Device Detail", id="inspect-title")
+                yield Static(content, id="inspect-content")
+                yield Label("[dim]Press Esc to close[/dim]", id="inspect-hint")
+
+        def _build_content(self, d):
+            lines = []
+
+            name = d["name"] or d.get("apple_identity") or "(unknown)"
+            lines.append(f"  Name:         {name}")
+            lines.append(f"  Vendor:       {d.get('vendor') or 'unknown'}")
+            lines.append(f"  Address:      {d['address']}")
+
+            rnd = d.get("random", False)
+            type_str = d["type"]
+            if rnd:
+                type_str += "  \U0001f504 randomized"
+            lines.append(f"  Type:         {type_str}")
+
+            rssi = d.get("rssi")
+            if rssi is not None:
+                bar = signal_bar(rssi, width=20)
+                color_label = "strong" if rssi >= -50 else ("medium" if rssi >= -70 else "weak")
+                lines.append(f"  Signal:       {rssi} dBm  {bar}  ({color_label})")
+            else:
+                empty_bar = '░' * 20
+                lines.append(f"  Signal:       —  {empty_bar}")
+
+            lines.append(f"  Randomized:   {'yes' if rnd else 'no'}")
+
+            if d.get("first_seen"):
+                lines.append(f"  First seen:   {d['first_seen'].strftime('%H:%M:%S')}")
+            if d.get("last_seen"):
+                lines.append(f"  Last seen:    {d['last_seen'].strftime('%H:%M:%S')}")
+
+            if d.get("paired"):
+                lines.append(f"  Paired:       yes")
+            if d.get("connected"):
+                lines.append(f"  Connected:    yes")
+
+            if d.get("apple_identity"):
+                lines.append(f"")
+                lines.append(f"  Apple Identity: {d['apple_identity']}")
+
+            if d.get("apple_details"):
+                lines.append(f"  Continuity Details:")
+                for t, detail in d["apple_details"]:
+                    lines.append(f"    \u2022 {t}{': ' + detail if detail else ''}")
+
+            return "\n".join(lines)
+
+        def action_close(self) -> None:
+            self.dismiss()
+
+
+    class BTRadarApp(App):
+        """Interactive Bluetooth scanner TUI built with Textual."""
+
+        TITLE = "btradar"
+        SUB_TITLE = "Bluetooth Scanner v" + __version__
+
+        CSS = """
+        Screen {
+            layout: vertical;
+        }
+        #filter-input {
+            display: none;
+            height: 3;
+        }
+        DataTable {
+            height: 1fr;
+        }
+        #status-bar {
+            height: 1;
+            dock: bottom;
+            background: $primary-background-darken-1;
+            color: $text-muted;
+            padding: 0 2;
+            content-align: left middle;
+        }
+        """
+
+        BINDINGS = [
+            Binding("s", "scan", "Scan", show=True, priority=True),
+            Binding("enter", "inspect", "Inspect", show=True),
+            Binding("slash", "toggle_filter", "Filter", show=True, priority=True),
+            Binding("q", "quit", "Quit", show=True, priority=True),
+        ]
+
+        def __init__(self, classic_sec=10, ble_sec=10, classic_only=False, ble_only=False):
+            super().__init__()
+            self._classic_sec = classic_sec
+            self._ble_sec = ble_sec
+            self._classic_only = classic_only
+            self._ble_only = ble_only
+            self._tracker = DeviceTracker()
+            self._filter_text = ""
+            self._scanning = False
+
+        def compose(self) -> ComposeResult:
+            yield Input(
+                placeholder="Type to filter\u2026 (Esc to close)",
+                id="filter-input",
+            )
+            yield DataTable(id="device-table", cursor_type="row")
+            yield Static(self._status_text(), id="status-bar")
+
+        async def on_mount(self) -> None:
+            table = self.query_one(DataTable)
+            table.add_column("NAME")
+            table.add_column("VENDOR")
+            table.add_column("ADDRESS")
+            table.add_column("TYPE")
+            table.add_column("SIGNAL")
+            table.add_column("IDENTITY")
+            table.focus()
+            await self._run_scan()
+
+        # ── Actions ────────────────────────────────────────────────
+
+        def action_scan(self) -> None:
+            if self._scanning:
+                return
+            self.run_worker(self._run_scan, exclusive=True, group="scan")
+
+        def action_inspect(self) -> None:
+            """Inspect the currently selected device."""
+            table = self.query_one(DataTable)
+            if table.cursor_row is None:
+                return
+            try:
+                row_key = str(table.get_row_at(table.cursor_row))
+            except Exception:
+                return
+            # Try getting the key directly from the table
+            for rk in table.rows:
+                if table.cursor_row is not None and rk in [str(k) for k in table.rows.keys()]:
+                    device = self._tracker.get_by_id(rk)
+                    if device:
+                        self.push_screen(DeviceInspectScreen(device))
+                        return
+            # Fallback: try row index
+            rows = list(self._tracker.get_sorted())
+            if self._filter_text:
+                ft = self._filter_text.lower()
+                rows = [d for d in rows if ft in (d.get('name') or '').lower() or ft in (d.get('vendor') or '').lower() or ft in (d.get('apple_identity') or '').lower()]
+            idx = table.cursor_row
+            if 0 <= idx < len(rows):
+                self.push_screen(DeviceInspectScreen(rows[idx]))
+
+        async def _run_scan(self) -> None:
+            self._scanning = True
+            self._update_status_bar("Scanning\u2026")
+
+            try:
+                devices = await asyncio.to_thread(
+                    do_scan,
+                    self._classic_sec,
+                    self._ble_sec,
+                    self._classic_only,
+                    self._ble_only,
+                )
+            except Exception as e:
+                self._scanning = False
+                self._update_status_bar(f"Scan error: {e}")
+                return
+
+            self._scanning = False
+            self._tracker.update(devices)
+            self._refresh_table()
+            self._update_status_bar()
+
+        def action_toggle_filter(self) -> None:
+            filter_input = self.query_one("#filter-input")
+            if filter_input.display:
+                filter_input.display = False
+                self._filter_text = ""
+                filter_input.value = ""
+                self.query_one(DataTable).focus()
+                self._refresh_table()
+            else:
+                filter_input.display = True
+                filter_input.focus()
+
+        # ── Table ──────────────────────────────────────────────────
+
+        def _build_row_cells(self, dev):
+            """Build styled cells for one device row."""
+            dtype = dev["type"]
+            if dtype == "Apple":
+                base = "cyan"
+            elif dtype == "Classic":
+                base = "green"
+            else:
+                base = "blue"
+
+            name = dev["name"] or dev.get("apple_identity") or "(unknown)"
+            name_cell = Text(name[:36], style=base)
+
+            if is_real_mac(dev["address"]):
+                if dev.get("vendor"):
+                    vendor_str = dev["vendor"][:28]
+                elif dev.get("random"):
+                    vendor_str = "private/randomized"
+                else:
+                    vendor_str = "unknown"
+            else:
+                vendor_str = "n/a (macOS hides MAC)"
+            vendor_cell = Text(vendor_str, style=base)
+
+            addr = dev["address"]
+            if dev.get("random"):
+                addr += " \U0001f504"
+            addr_cell = Text(addr, style=f"dim {base}")
+
+            type_cell = Text(dtype, style=f"bold {base}")
+
+            rssi = dev.get("rssi")
+            if rssi is not None:
+                bar = signal_bar(rssi)
+                signal_cell = Text(f"{rssi:>5}dBm {bar}", style=rssi_color(rssi))
+            else:
+                signal_cell = Text("    \u2014  \u2591" * 5, style="dim")
+
+            identity = dev.get("apple_identity") or ""
+            if not identity and dev.get("paired"):
+                identity = "paired"
+            elif not identity and dev.get("connected"):
+                identity = "connected"
+            identity_cell = Text(identity, style=base if identity else "dim")
+
+            return [name_cell, vendor_cell, addr_cell, type_cell, signal_cell, identity_cell]
+
+        def _refresh_table(self) -> None:
+            table = self.query_one(DataTable)
+            table.clear()
+
+            devices = self._tracker.get_sorted()
+
+            # Apply filter
+            if self._filter_text:
+                ft = self._filter_text.lower()
+                devices = [
+                    d for d in devices
+                    if ft in (d["name"] or "").lower()
+                    or ft in (d.get("vendor") or "").lower()
+                    or ft in (d["address"] or "").lower()
+                    or ft in (d.get("apple_identity") or "").lower()
+                ]
+
+            if not devices:
+                placeholder = (
+                    f"No matches for '{self._filter_text}'"
+                    if self._filter_text
+                    else "No devices found. Press 's' to scan."
+                )
+                table.add_row(
+                    Text(placeholder, style="dim"),
+                    Text(""), Text(""), Text(""), Text(""), Text(""),
+                    key="__empty__",
+                )
+            else:
+                for dev in devices:
+                    cells = self._build_row_cells(dev)
+                    table.add_row(*cells, key=dev["id"])
+
+            self._update_status_bar()
+
+        # ── Filter ─────────────────────────────────────────────────
+
+        def on_input_changed(self, event: Input.Changed) -> None:
+            if event.input.id == "filter-input":
+                self._filter_text = event.value
+                self._refresh_table()
+
+        # ── Row selection → inspect ────────────────────────────────
+
+        def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+            row_key = str(event.row_key)
+            if row_key == "__empty__":
+                return
+            device = self._tracker.get_by_id(row_key)
+            if device:
+                self.push_screen(DeviceInspectScreen(device))
+
+        # ── Escape from filter ─────────────────────────────────────
+
+        def on_key(self, event: events.Key) -> None:
+            if event.key == "escape":
+                filter_input = self.query_one("#filter-input")
+                if filter_input.display:
+                    event.stop()
+                    self.action_toggle_filter()
+
+        # ── Status bar ─────────────────────────────────────────────
+
+        def _status_text(self, message=""):
+            count = len(self._tracker.devices)
+            ts = datetime.now().strftime("%H:%M:%S")
+            filter_info = f" | Filter: {self._filter_text}" if self._filter_text else ""
+
+            if message:
+                parts = [
+                    f"btradar v{__version__}",
+                    message,
+                    f"{count} device(s){filter_info}",
+                    ts,
+                ]
+            else:
+                parts = [
+                    f"btradar v{__version__}",
+                    "s:scan  Enter:inspect  /:filter  q:quit",
+                    f"{count} device(s){filter_info}",
+                    ts,
+                ]
+            return " | ".join(parts)
+
+        def _update_status_bar(self, message=""):
+            try:
+                self.query_one("#status-bar").update(self._status_text(message))
+            except Exception:
+                pass
+
+
+    # ╔══════════════════════════════════════════════════════════════════╗
+    # ║  ONE-SHOT / JSON / LOOKUP OUTPUT                               ║
+    # ╚══════════════════════════════════════════════════════════════════╝
+
+    # ║  CLI ENTRY POINT                                                ║
+    # ╚══════════════════════════════════════════════════════════════════╝
+
+
+    return BTRadarApp
+
+
+def _build_rich_row(dev):
+    """Build a Rich-table row dict for one device (used by one-shot output)."""
+    from rich.text import Text
+
+    name = dev["name"] or dev.get("apple_identity") or "(unknown)"
+    name = name[:36]
+
+    if is_real_mac(dev["address"]):
+        if dev.get("vendor"):
+            vendor_str = dev["vendor"][:28]
+        elif dev.get("random"):
+            vendor_str = "private/randomized"
+        else:
+            vendor_str = "unknown"
+    else:
+        vendor_str = "n/a (macOS hides MAC)"
+
+    addr = dev["address"]
+    if dev.get("random"):
+        addr += " \U0001f504"
+
+    dtype = dev["type"]
+    if dtype == "Apple":
+        type_style = "bold cyan"
+    elif dtype == "Classic":
+        type_style = "green"
+    else:
+        type_style = "blue"
+
+    rssi_val = dev.get("rssi")
+    if rssi_val is not None:
+        bar = signal_bar(rssi_val)
+        rssi_str = f"{rssi_val:>5}dBm"
+        signal = Text(f"{rssi_str} {bar}", style=rssi_color(rssi_val))
+    else:
+        signal = Text("    \u2014  \u2591" * 5, style="dim")
+
+    identity = dev.get("apple_identity") or ""
+    if not identity and dev.get("paired"):
+        identity = "paired"
+    elif not identity and dev.get("connected"):
+        identity = "connected"
+
+    return {
+        "NAME": Text(name, style=type_style),
+        "VENDOR": Text(vendor_str, style=type_style),
+        "ADDRESS": Text(addr, style=f"dim {type_style}"),
+        "TYPE": Text(dtype, style=f"bold {type_style}"),
+        "SIGNAL": signal,
+        "IDENTITY": Text(identity, style=type_style if identity else "dim"),
+    }
+
+
+def one_shot_table(classic_sec, ble_sec, classic_only, ble_only):
+    """Single scan, pretty table to stdout."""
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+    devices = do_scan(classic_sec, ble_sec, classic_only, ble_only)
+    devices.sort(
+        key=lambda d: d["rssi"] if d["rssi"] is not None else -999, reverse=True
+    )
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    table = Table(
+        title=f"[bold]\U0001f4e1  btradar[/]  [dim]{ts}  \u2022  {len(devices)} device(s)[/]",
+        show_lines=False,
+        pad_edge=True,
+        padding=(0, 1),
+        border_style="dim",
+    )
+    table.add_column("NAME", style="bold", no_wrap=True, min_width=28, max_width=38)
+    table.add_column("VENDOR", no_wrap=True, min_width=16, max_width=30)
+    table.add_column("ADDRESS", style="dim", no_wrap=True, min_width=18)
+    table.add_column("TYPE", no_wrap=True, min_width=10)
+    table.add_column("SIGNAL", no_wrap=True, min_width=22)
+    table.add_column("IDENTITY", style="cyan", no_wrap=True, min_width=12)
+
+    if not devices:
+        console.print(
+            "[dim]No devices found. Bluetooth may be off, "
+            "or nothing is advertising.[/dim]"
+        )
+        return
+
+    for dev in devices:
+        row = _build_rich_row(dev)
+        table.add_row(
+            row["NAME"], row["VENDOR"], row["ADDRESS"],
+            row["TYPE"], row["SIGNAL"], row["IDENTITY"],
+        )
+
+    console.print(table)
+    console.print(
+        "[dim]  'random' \U0001f504 = address rotates, identity can't be tracked[/]"
+    )
+
+
+def json_output(classic_sec, ble_sec, classic_only, ble_only):
+    """Single scan, JSON output."""
+    devices = do_scan(classic_sec, ble_sec, classic_only, ble_only)
+    devices.sort(
+        key=lambda d: d["rssi"] if d["rssi"] is not None else -999, reverse=True
+    )
+
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    for d in devices:
+        if d.get("apple_details"):
+            d["apple_details"] = [
+                {"type": t, "detail": detail} for t, detail in d["apple_details"]
+            ]
+    print(
+        json.dumps(
+            {"scanned": stamp, "version": __version__, "devices": devices},
+            indent=2,
+        )
+    )
+
+
+def lookup_one(addr, online=True):
+    """Resolve a single MAC address."""
+    from rich.console import Console
+
+    console = Console()
+    v = vendor_lookup(addr, online=online)
+    rnd = is_randomized(addr)
+    mac = is_real_mac(addr)
+
+    parts = []
+    parts.append(f"[bold]{addr}[/]")
+    if v:
+        parts.append(f"  Vendor: [green]{v}[/]")
+    else:
+        parts.append("  Vendor: [dim]no match[/]")
+    if rnd:
+        parts.append("  [yellow]\u26a0 Randomized / private MAC (locally administered)[/]")
+    if not mac:
+        parts.append(
+            "  [dim]Not a real 48-bit MAC (BLE UUID on macOS?)[/]"
+        )
+    console.print("".join(parts))
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="btradar",
+        description="\U0001f4e1 Unified Bluetooth scanner TUI for macOS",
+    )
+
+    ap.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
+    ap.add_argument(
+        "-t",
+        "--time",
+        type=int,
+        default=10,
+        help="Scan duration in seconds (default 10 for TUI, 15 for scan)",
+    )
+    ap.add_argument(
+        "-b",
+        "--ble",
+        dest="mode",
+        action="store_const",
+        const="ble",
+        help="BLE only",
+    )
+    ap.add_argument(
+        "-c",
+        "--classic",
+        dest="mode",
+        action="store_const",
+        const="classic",
+        help="Classic BT only",
+    )
+    ap.add_argument("--offline", action="store_true", help="Skip online vendor lookup fallback")
+    ap.add_argument(
+        "--refresh-oui",
+        action="store_true",
+        help="Re-download IEEE OUI vendor database",
+    )
+    ap.add_argument("--lookup", metavar="MAC", help="Resolve one MAC address and exit")
+    ap.add_argument(
+        "--json", "-j", action="store_true", help="JSON output (one-shot)"
+    )
+    ap.add_argument(
+        "--refresh",
+        type=int,
+        default=3,
+        help="TUI refresh interval in seconds (default 3)",
+    )
+
+    sub = ap.add_subparsers(dest="command")
+
+    # btradar scan
+    scan_p = sub.add_parser("scan", help="One-shot scan, print table, exit")
+    scan_p.add_argument(
+        "-t", "--time", type=int, default=15, help="Scan seconds (default 15)"
+    )
+    scan_p.add_argument(
+        "-b", "--ble", dest="mode", action="store_const", const="ble"
+    )
+    scan_p.add_argument(
+        "-c", "--classic", dest="mode", action="store_const", const="classic"
+    )
+    scan_p.add_argument("--offline", action="store_true")
+    scan_p.add_argument("--json", "-j", action="store_true")
+
+    # btradar help [TOPIC]
+    help_p = sub.add_parser("help", help="Show help topics or search for a keyword")
+    help_p.add_argument("topic", nargs="?", default=None, help="Search for this keyword")
+    help_p.add_argument(
+        "--list", dest="list_topics", action="store_true",
+        help="Show all topic headers (same as bare help)"
+    )
+
+    args = ap.parse_args()
+
+    # Refresh OUI
+    if args.refresh_oui:
+        load_oui(refresh=True)
+        print("\u2705  OUI database refreshed.")
+        return
+
+    # Lookup one address
+    if args.lookup:
+        lookup_one(args.lookup, online=not args.offline)
+        return
+
+    # Help command
+    if args.command == "help":
+        if args.topic:
+            search_help(args.topic)
+        else:
+            show_help_topics()
+        return
+
+    # Determine scan mode
+    classic_only = args.mode == "classic"
+    ble_only = args.mode == "ble"
+
+    if args.command == "scan":
+        sec = args.time
+        if args.json:
+            json_output(sec, sec, classic_only, ble_only)
+        else:
+            one_shot_table(sec, sec, classic_only, ble_only)
+        return
+
+    # Default: TUI mode — check Bluetooth first
+    available, bt_msg = check_bluetooth_available()
+    if not available:
+        from rich.console import Console
+        console = Console()
+        console.print(f"\n[bold yellow]\u26a0  {bt_msg}[/bold yellow]")
+        console.print(
+            "[dim]Cannot start Bluetooth scanner. "
+            "Showing help instead.[/dim]\n"
+        )
+        show_help_topics()
+        return
+
+    sec = args.time
+    BTRadarApp = _build_tui()
+    app = BTRadarApp(
+        classic_sec=sec,
+        ble_sec=sec,
+        classic_only=classic_only,
+        ble_only=ble_only,
+    )
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
+
