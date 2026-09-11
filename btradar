@@ -1115,6 +1115,150 @@ def _build_tui():
             self.dismiss()
 
 
+    class DeviceActionLogScreen(ModalScreen):
+        """Live action log for a single BLE device."""
+
+        CSS = """
+        DeviceActionLogScreen {
+            align: center middle;
+        }
+        #log-container {
+            width: 90;
+            height: 85%;
+            border: thick $primary;
+            background: $surface;
+            padding: 1 2;
+        }
+        #log-title {
+            text-style: bold;
+            text-align: center;
+            margin-bottom: 1;
+            color: $accent;
+        }
+        #log-entries {
+            height: 1fr;
+            overflow-y: auto;
+        }
+        #log-hint {
+            text-align: center;
+            margin-top: 1;
+            color: $text-muted;
+        }
+        """
+
+        BINDINGS = [
+            Binding("escape", "close", "Close"),
+        ]
+
+        def __init__(self, device):
+            super().__init__()
+            self.device = device
+            self.target_id = device["id"]
+            self.log_entries = []
+            self._scanner = None
+            self._prev_rssi = None
+
+        def compose(self) -> ComposeResult:
+            from textual.containers import Vertical
+            name = self.device.get("name") or self.device.get("apple_identity") or self.target_id[:12]
+            with Vertical(id="log-container"):
+                yield Static(f"Action Log: {name}", id="log-title")
+                yield Static("Waiting for advertisements...", id="log-entries")
+                yield Label("[dim]Esc to close | Watching for BLE events from this device[/dim]", id="log-hint")
+
+        async def on_mount(self) -> None:
+            self._start_scanning()
+
+        def _start_scanning(self):
+            import asyncio
+
+            async def _scan():
+                from bleak import BleakScanner
+                target = self.target_id
+
+                def callback(device, adv):
+                    if str(device.address) != target:
+                        return
+                    now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    rssi = adv.rssi
+                    md = adv.manufacturer_data
+                    services = [str(s) for s in (adv.service_uuids or [])]
+                    name = adv.local_name or device.name or ""
+
+                    # Decode Apple Continuity
+                    apple_info = ""
+                    apple_payload = md.get(0x004C)
+                    if apple_payload:
+                        tlvs = parse_apple_tlvs(bytes(apple_payload))
+                        parts = []
+                        for t, payload in tlvs:
+                            tname = APPLE_TYPES.get(t, f"0x{t:02X}")
+                            detail = ""
+                            if t == 0x02 and len(payload) >= 21:
+                                maj = int.from_bytes(payload[16:18], "big")
+                                mnr = int.from_bytes(payload[18:20], "big")
+                                detail = f" maj={maj} min={mnr}"
+                            elif t == 0x10 and len(payload) >= 1:
+                                code = payload[0] & 0x0F
+                                detail = f" action={NEARBY_ACTION.get(code, code)}"
+                            elif t in (0x07, 0x0F) and len(payload) >= 3:
+                                b = payload[:8]
+                                lo = [x & 0x0F for x in b]
+                                bats = []
+                                if lo[0]: bats.append(f"L={lo[0]*100//14}%")
+                                if len(lo) > 1 and lo[1]: bats.append(f"R={lo[1]*100//14}%")
+                                if len(lo) > 2 and lo[2]: bats.append(f"C={lo[2]*100//14}%")
+                                if bats: detail = " " + ",".join(bats)
+                            parts.append(f"{tname}{detail}")
+                        apple_info = " | Apple: " + ", ".join(parts)
+
+                    # RSSI delta
+                    rssi_delta = ""
+                    if self._prev_rssi is not None:
+                        delta = rssi - self._prev_rssi
+                        if delta != 0:
+                            rssi_delta = f" ({delta:+d})"
+                    self._prev_rssi = rssi
+
+                    svc_str = f" Svc:[{','.join(services)}]" if services else ""
+                    name_str = f' Name:"{name}"' if name else ""
+
+                    entry = f"[dim]{now}[/]  {rssi}dBm{rssi_delta}{apple_info}{svc_str}{name_str}"
+                    self.log_entries.append(entry)
+                    self._update_display()
+
+                try:
+                    self._scanner = BleakScanner(callback)
+                    await self._scanner.start()
+                    await asyncio.sleep(300)  # 5 minutes max
+                    await self._scanner.stop()
+                except Exception as e:
+                    self.log_entries.append(f"[red]Scanner error: {e}[/red]")
+                    self._update_display()
+
+            self.run_worker(_scan, exclusive=True, group="actionlog")
+
+        def _update_display(self):
+            try:
+                widget = self.query_one("#log-entries")
+                # Show last 100 entries
+                visible = self.log_entries[-100:]
+                widget.update("\n".join(visible))
+                # Auto-scroll to bottom
+                widget.scroll_end()
+            except Exception:
+                pass
+
+        def action_close(self) -> None:
+            if self._scanner:
+                import asyncio
+                try:
+                    asyncio.get_event_loop().create_task(self._scanner.stop())
+                except Exception:
+                    pass
+            self.dismiss()
+
+
     class BTRadarApp(App):
         """Interactive Bluetooth scanner TUI built with Textual."""
 
@@ -1145,6 +1289,7 @@ def _build_tui():
         BINDINGS = [
             Binding("s", "scan", "Scan", show=True, priority=True),
             Binding("i", "inspect", "Inspect", show=True),
+            Binding("a", "action_log", "Action Log", show=True),
             Binding("slash", "toggle_filter", "Filter", show=True, priority=True),
             Binding("q", "quit", "Quit", show=True, priority=True),
         ]
@@ -1204,6 +1349,19 @@ def _build_tui():
             idx = table.cursor_row
             if 0 <= idx < len(devices):
                 self.push_screen(DeviceInspectScreen(devices[idx]))
+
+        def action_action_log(self) -> None:
+            """Open live action log for selected device."""
+            table = self.query_one(DataTable)
+            if table.cursor_row is None:
+                return
+            devices = self._tracker.get_sorted()
+            if self._filter_text:
+                ft = self._filter_text.lower()
+                devices = [d for d in devices if ft in (d.get("name") or "").lower() or ft in (d.get("vendor") or "").lower() or ft in (d.get("apple_identity") or "").lower()]
+            idx = table.cursor_row
+            if 0 <= idx < len(devices):
+                self.push_screen(DeviceActionLogScreen(devices[idx]))
 
         async def _run_scan(self) -> None:
             self._scanning = True
