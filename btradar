@@ -23,7 +23,7 @@ Usage:
 First run auto-creates a venv and installs bleak + rich + textual.
 """
 
-__version__ = "2.0.1"
+__version__ = "2.1.0"
 
 import argparse
 import asyncio
@@ -33,7 +33,9 @@ import re
 import subprocess
 import sys
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
+import sqlite3
+import time
 
 # ╔══════════════════════════════════════════════════════════════════╗
 # ║  AUTO-DEPS BOOTSTRAPPER                                         ║
@@ -987,7 +989,14 @@ class DeviceTracker:
                 entry = dict(dev)
                 entry["first_seen"] = now
                 entry["last_seen"] = now
+                entry["zone_history"] = []
                 self.devices[sid] = entry
+            # Record in SQLite history
+            try:
+                history_record_device(self.devices[sid])
+                history_record_event(self.devices[sid])
+            except Exception:
+                pass
 
     def get_sorted(self):
         """Return devices sorted by RSSI (strongest first)."""
@@ -999,6 +1008,208 @@ class DeviceTracker:
 
     def get_by_id(self, stable_id):
         return self.devices.get(stable_id)
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  SQLite History Database                                        ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+HISTORY_DB_DIR = os.path.expanduser("~/.btradar")
+HISTORY_DB = os.path.join(HISTORY_DB_DIR, "history.db")
+
+
+def init_history_db():
+    """Create history database and tables if they don't exist."""
+    os.makedirs(HISTORY_DB_DIR, exist_ok=True)
+    conn = sqlite3.connect(HISTORY_DB)
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS devices (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        vendor TEXT,
+        address TEXT,
+        type TEXT,
+        first_seen TEXT,
+        last_seen TEXT,
+        last_rssi INTEGER,
+        apple_identity TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id TEXT,
+        timestamp TEXT,
+        rssi INTEGER,
+        apple_identity TEXT,
+        raw_manufacturer_data TEXT,
+        FOREIGN KEY(device_id) REFERENCES devices(id)
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_events_device ON events(device_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp)")
+    conn.commit()
+    conn.close()
+
+
+def history_record_device(dev):
+    """Insert or update a device in history."""
+    now = datetime.now().isoformat()
+    conn = sqlite3.connect(HISTORY_DB)
+    c = conn.cursor()
+    c.execute("""INSERT INTO devices (id, name, vendor, address, type, first_seen, last_seen, last_rssi, apple_identity)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            name = COALESCE(NULLIF(excluded.name, ''), devices.name),
+            vendor = COALESCE(NULLIF(excluded.vendor, ''), devices.vendor),
+            address = excluded.address,
+            type = excluded.type,
+            last_seen = excluded.last_seen,
+            last_rssi = excluded.last_rssi,
+            apple_identity = COALESCE(NULLIF(excluded.apple_identity, ''), devices.apple_identity)
+    """, (
+        dev["id"],
+        dev.get("name", ""),
+        dev.get("vendor", ""),
+        dev.get("address", ""),
+        dev.get("type", ""),
+        now,
+        now,
+        dev.get("rssi"),
+        dev.get("apple_identity", ""),
+    ))
+    conn.commit()
+    conn.close()
+
+
+def history_record_event(dev):
+    """Record a scan event for a device."""
+    now = datetime.now().isoformat()
+    conn = sqlite3.connect(HISTORY_DB)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO events (device_id, timestamp, rssi, apple_identity, raw_manufacturer_data) VALUES (?, ?, ?, ?, ?)",
+        (dev["id"], now, dev.get("rssi"), dev.get("apple_identity", ""), ""),
+    )
+    conn.commit()
+    conn.close()
+
+
+def history_load_devices():
+    """Load all devices from history DB."""
+    if not os.path.exists(HISTORY_DB):
+        return []
+    conn = sqlite3.connect(HISTORY_DB)
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, name, vendor, address, type, first_seen, last_seen, last_rssi, apple_identity "
+        "FROM devices ORDER BY last_seen DESC"
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [
+        {
+            "id": r[0], "name": r[1], "vendor": r[2], "address": r[3], "type": r[4],
+            "first_seen": r[5], "last_seen": r[6], "last_rssi": r[7], "apple_identity": r[8],
+        }
+        for r in rows
+    ]
+
+
+def history_prune():
+    """Delete events older than 30 days."""
+    if not os.path.exists(HISTORY_DB):
+        return
+    conn = sqlite3.connect(HISTORY_DB)
+    c = conn.cursor()
+    cutoff = (datetime.now() - timedelta(days=30)).isoformat()
+    c.execute("DELETE FROM events WHERE timestamp < ?", (cutoff,))
+    conn.commit()
+    conn.close()
+
+
+def history_get_event_count(device_id):
+    """Get total event count for a device."""
+    if not os.path.exists(HISTORY_DB):
+        return 0
+    conn = sqlite3.connect(HISTORY_DB)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM events WHERE device_id = ?", (device_id,))
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
+
+def history_get_events_per_minute(device_id, window_minutes=1):
+    """Get events in the last N minutes for a device."""
+    if not os.path.exists(HISTORY_DB):
+        return 0
+    conn = sqlite3.connect(HISTORY_DB)
+    c = conn.cursor()
+    cutoff = (datetime.now() - timedelta(minutes=window_minutes)).isoformat()
+    c.execute("SELECT COUNT(*) FROM events WHERE device_id = ? AND timestamp > ?", (device_id, cutoff))
+    count = c.fetchone()[0]
+    conn.close()
+    return count
+
+
+def history_get_zone_history(device_id):
+    """Get zone history for a device from events."""
+    if not os.path.exists(HISTORY_DB):
+        return []
+    conn = sqlite3.connect(HISTORY_DB)
+    c = conn.cursor()
+    c.execute("SELECT timestamp, rssi FROM events WHERE device_id = ? ORDER BY timestamp DESC LIMIT 50", (device_id,))
+    rows = c.fetchall()
+    conn.close()
+    zones = []
+    for ts, rssi in rows:
+        if rssi is not None:
+            if rssi > -50:
+                zones.append("immediate")
+            elif rssi > -60:
+                zones.append("near")
+            elif rssi > -70:
+                zones.append("far")
+            else:
+                zones.append("remote")
+        else:
+            zones.append("unknown")
+    return zones
+
+
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  Watched Device Alerts                                          ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+def load_watched():
+    """Load watched device IDs from JSON file."""
+    watched_file = os.path.join(HISTORY_DB_DIR, "watched.json")
+    if os.path.exists(watched_file):
+        try:
+            with open(watched_file) as f:
+                data = json.load(f)
+                return set(data.get("watched", []))
+        except Exception:
+            pass
+    return set()
+
+
+def save_watched(watched_set):
+    """Save watched device IDs to JSON file."""
+    watched_file = os.path.join(HISTORY_DB_DIR, "watched.json")
+    os.makedirs(HISTORY_DB_DIR, exist_ok=True)
+    with open(watched_file, "w") as f:
+        json.dump({"watched": list(watched_set)}, f, indent=2)
+
+
+def _send_notification(title, message):
+    """Send macOS notification if terminal-notifier is available."""
+    try:
+        subprocess.Popen(
+            ["terminal-notifier", "-title", title, "-message", message],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        pass
 
 
 # ╔══════════════════════════════════════════════════════════════════╗
@@ -1135,6 +1346,13 @@ def _build_tui():
             margin-bottom: 1;
             color: $accent;
         }
+        #log-stats {
+            height: auto;
+            margin-bottom: 1;
+            padding: 0 1;
+            background: $primary-background-darken-1;
+            color: $text-muted;
+        }
         #log-entries {
             height: 1fr;
             overflow-y: auto;
@@ -1157,14 +1375,94 @@ def _build_tui():
             self.log_entries = []
             self._scanner = None
             self._prev_rssi = None
+            self._rssi_history = []  # last 5 RSSI readings
+            self._event_count = 0
+            self._first_event_time = None
+            self._last_event_time = None
+            self._event_times = []  # timestamps for events/minute
 
         def compose(self) -> ComposeResult:
             from textual.containers import Vertical
             name = self.device.get("name") or self.device.get("apple_identity") or self.target_id[:12]
             with Vertical(id="log-container"):
                 yield Static(f"Action Log: {name}", id="log-title")
-                yield Static("Waiting for advertisements...", id="log-entries")
+                yield Static("Waiting for advertisements...", id="log-stats")
+                yield Static("", id="log-entries")
                 yield Label("[dim]Esc to close | Watching for BLE events from this device[/dim]", id="log-hint")
+
+        def _compute_zone(self, rssi):
+            """Classify RSSI into proximity zone."""
+            if rssi is None:
+                return "unknown"
+            if rssi > -50:
+                return "immediate"
+            elif rssi > -60:
+                return "near"
+            elif rssi > -70:
+                return "far"
+            else:
+                return "remote"
+
+        def _compute_rssi_trend(self):
+            """Moving average of last 5 readings, return (avg, arrow)."""
+            if not self._rssi_history:
+                return None, ""
+            avg = sum(self._rssi_history) / len(self._rssi_history)
+            if len(self._rssi_history) >= 2:
+                prev_avg = sum(self._rssi_history[:-1]) / len(self._rssi_history[:-1])
+                if avg > prev_avg + 1:
+                    arrow = "▲"
+                elif avg < prev_avg - 1:
+                    arrow = "▼"
+                else:
+                    arrow = "─"
+            else:
+                arrow = "─"
+            return avg, arrow
+
+        def _update_stats(self):
+            """Update the stats bar with zone, trend, interval, count."""
+            try:
+                stats_widget = self.query_one("#log-stats")
+            except Exception:
+                return
+
+            rssi = self._prev_rssi
+            zone = self._compute_zone(rssi)
+
+            # RSSI trend
+            avg, arrow = self._compute_rssi_trend()
+            trend_str = f"avg={avg:.0f}dBm {arrow}" if avg is not None else "—"
+
+            # Advertisement interval
+            interval_str = "—"
+            if self._last_event_time is not None and self._first_event_time is not None:
+                dt = (self._last_event_time - self._first_event_time).total_seconds()
+                if dt > 0 and self._event_count > 1:
+                    interval_str = f"{dt / (self._event_count - 1):.1f}s avg"
+
+            # Events per minute
+            now = datetime.now()
+            cutoff = now - timedelta(minutes=1)
+            recent = [t for t in self._event_times if t > cutoff]
+            epm = len(recent)
+
+            zone_colors = {
+                "immediate": "bold green",
+                "near": "green",
+                "far": "yellow",
+                "remote": "red",
+                "unknown": "dim",
+            }
+            zone_style = zone_colors.get(zone, "dim")
+
+            stats = (
+                f"Zone: [{zone_style}]{zone}[/]  │  "
+                f"Trend: {trend_str}  │  "
+                f"Interval: {interval_str}  │  "
+                f"Events: {self._event_count} total, {epm}/min"
+            )
+            stats_widget.update(stats)
 
         async def on_mount(self) -> None:
             self._start_scanning()
@@ -1179,11 +1477,25 @@ def _build_tui():
                 def callback(device, adv):
                     if str(device.address) != target:
                         return
-                    now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    now = datetime.now()
+                    now_str = now.strftime("%H:%M:%S.%f")[:-3]
                     rssi = adv.rssi
                     md = adv.manufacturer_data
                     services = [str(s) for s in (adv.service_uuids or [])]
                     name = adv.local_name or device.name or ""
+
+                    # Track seen count and timing
+                    self._event_count += 1
+                    if self._first_event_time is None:
+                        self._first_event_time = now
+                    self._last_event_time = now
+                    self._event_times.append(now)
+
+                    # Track RSSI for trend
+                    if rssi is not None:
+                        self._rssi_history.append(rssi)
+                        if len(self._rssi_history) > 5:
+                            self._rssi_history = self._rssi_history[-5:]
 
                     # Decode Apple Continuity
                     apple_info = ""
@@ -1220,12 +1532,17 @@ def _build_tui():
                             rssi_delta = f" ({delta:+d})"
                     self._prev_rssi = rssi
 
+                    # Proximity zone
+                    zone = self._compute_zone(rssi)
+                    zone_label = f" [{zone}]" if rssi is not None else ""
+
                     svc_str = f" Svc:[{','.join(services)}]" if services else ""
                     name_str = f' Name:"{name}"' if name else ""
 
-                    entry = f"[dim]{now}[/]  {rssi}dBm{rssi_delta}{apple_info}{svc_str}{name_str}"
+                    entry = f"[dim]{now_str}[/]  {rssi}dBm{rssi_delta}{zone_label}{apple_info}{svc_str}{name_str}"
                     self.log_entries.append(entry)
                     self._update_display()
+                    self._update_stats()
 
                 try:
                     self._scanner = BleakScanner(callback)
@@ -1256,6 +1573,396 @@ def _build_tui():
                     asyncio.get_event_loop().create_task(self._scanner.stop())
                 except Exception:
                     pass
+            self.dismiss()
+
+
+    class DeviceGATTScreen(ModalScreen):
+        """GATT service/characteristic browser for a BLE device."""
+
+        CSS = """
+        DeviceGATTScreen {
+            align: center middle;
+        }
+        #gatt-container {
+            width: 92;
+            height: 85%;
+            border: thick $primary;
+            background: $surface;
+            padding: 1 2;
+        }
+        #gatt-title {
+            text-style: bold;
+            text-align: center;
+            margin-bottom: 1;
+            color: $accent;
+        }
+        #gatt-status {
+            height: 1;
+            margin-bottom: 1;
+            color: $text-muted;
+        }
+        #gatt-table {
+            height: 1fr;
+        }
+        #gatt-hint {
+            text-align: center;
+            margin-top: 1;
+            color: $text-muted;
+        }
+        """
+
+        BINDINGS = [
+            Binding("escape", "close", "Close"),
+            Binding("r", "read_char", "Read"),
+        ]
+
+        def __init__(self, device_uuid, tracker=None):
+            super().__init__()
+            self.device_uuid = device_uuid
+            self.tracker = tracker
+            self._client = None
+            self._services_data = []
+            self._char_rows = {}  # row_key -> (service_uuid, char_uuid)
+
+        def compose(self) -> ComposeResult:
+            from textual.containers import Vertical
+            with Vertical(id="gatt-container"):
+                yield Static(f"GATT: {self.device_uuid}", id="gatt-title")
+                yield Static("Connecting...", id="gatt-status")
+                yield DataTable(id="gatt-table", cursor_type="row")
+                yield Label("[dim]r: read value | Esc: disconnect & close[/dim]", id="gatt-hint")
+
+        async def on_mount(self) -> None:
+            table = self.query_one("#gatt-table")
+            table.add_column("SERVICE / CHARACTERISTIC")
+            table.add_column("PROPERTIES")
+            table.add_column("VALUE")
+            table.add_column("UUID")
+            self.run_worker(self._connect_and_discover, exclusive=True, group="gatt")
+
+        async def _connect_and_discover(self):
+            from bleak import BleakClient
+
+            try:
+                status = self.query_one("#gatt-status")
+                status.update("Connecting...")
+            except Exception:
+                pass
+
+            try:
+                self._client = BleakClient(self.device_uuid)
+                await self._client.connect(timeout=15.0)
+            except Exception as e:
+                try:
+                    self.query_one("#gatt-status").update(f"[red]Connect failed: {e}[/red]")
+                except Exception:
+                    pass
+                return
+
+            try:
+                self.query_one("#gatt-status").update("Connected — discovering services...")
+            except Exception:
+                pass
+
+            try:
+                table = self.query_one("#gatt-table")
+                self._services_data = []
+                self._char_rows = {}
+                row_idx = 0
+
+                for service in self._client.services:
+                    svc_uuid = str(service.uuid)
+                    svc_name = service.name or ""
+                    svc_label = f"SERVICE: {svc_uuid}" + (f" ({svc_name})" if svc_name else "")
+                    row_key = f"svc_{row_idx}"
+                    table.add_row(
+                        Text(svc_label, style="bold cyan"),
+                        Text(""),
+                        Text(""),
+                        Text(svc_uuid, style="dim"),
+                        key=row_key,
+                    )
+                    self._services_data.append({"uuid": svc_uuid, "name": svc_name, "chars": []})
+                    row_idx += 1
+
+                    for char in service.characteristics:
+                        char_uuid = str(char.uuid)
+                        char_name = char.name or ""
+                        props = ", ".join(char.properties)
+                        char_label = f"  └ {char_uuid}" + (f" ({char_name})" if char_name else "")
+                        row_key = f"char_{row_idx}"
+                        table.add_row(
+                            Text(char_label, style="green"),
+                            Text(props, style="yellow"),
+                            Text("(not read)", style="dim"),
+                            Text(char_uuid, style="dim"),
+                            key=row_key,
+                        )
+                        self._char_rows[row_key] = (svc_uuid, char_uuid)
+                        self._services_data[-1]["chars"].append({
+                            "uuid": char_uuid,
+                            "name": char_name,
+                            "properties": char.properties,
+                            "value": None,
+                        })
+                        row_idx += 1
+
+                try:
+                    self.query_one("#gatt-status").update(
+                        f"Connected — {len(self._services_data)} services, "
+                        f"{sum(len(s['chars']) for s in self._services_data)} characteristics"
+                    )
+                except Exception:
+                    pass
+
+            except Exception as e:
+                try:
+                    self.query_one("#gatt-status").update(f"[red]Discovery error: {e}[/red]")
+                except Exception:
+                    pass
+
+        def action_read_char(self):
+            """Read the value of the selected characteristic."""
+            table = self.query_one("#gatt-table")
+            if table.cursor_row is None:
+                return
+            row_key = str(table.cursor_row_key)
+            if row_key not in self._char_rows:
+                return  # Not a characteristic row
+            self.run_worker(
+                self._read_characteristic, row_key, exclusive=True, group="gatt-read"
+            )
+
+        async def _read_characteristic(self, row_key):
+            if not self._client or not self._client.is_connected:
+                return
+
+            svc_uuid, char_uuid = self._char_rows[row_key]
+            try:
+                status = self.query_one("#gatt-status")
+                status.update(f"Reading {char_uuid}...")
+            except Exception:
+                pass
+
+            try:
+                value = await self._client.read_gatt_char(char_uuid)
+                # Format value as hex + ASCII
+                hex_str = value.hex()
+                ascii_str = ""
+                try:
+                    ascii_str = value.decode("utf-8", errors="replace")
+                    ascii_str = "".join(c if 32 <= ord(c) < 127 else "." for c in ascii_str)
+                except Exception:
+                    pass
+                display_val = hex_str[:60]
+                if ascii_str:
+                    display_val += f"  ({ascii_str[:30]})"
+
+                # Update table
+                table = self.query_one("#gatt-table")
+                rows = list(table.rows.keys())
+                if row_key in rows:
+                    cells = table.get_row(row_key)
+                    # cells is a tuple; replace the value column (index 2)
+                    new_cells = list(cells)
+                    new_cells[2] = Text(display_val, style="bold white")
+                    table.remove_row(row_key)
+                    # Re-insert at the same position
+                    idx = rows.index(row_key)
+                    # We need to rebuild the table to maintain order
+                    # Instead, just update the data and rebuild
+                    pass
+
+                # Simpler approach: update via remove and re-add
+                # Actually, let's just update the cell display differently
+                # DataTable doesn't have a cell-update API, so let's use a different approach
+
+                # Store value on the services data
+                for svc in self._services_data:
+                    for ch in svc["chars"]:
+                        if ch["uuid"] == char_uuid:
+                            ch["value"] = value.hex()
+
+                # Rebuild the table to show the value
+                self._rebuild_table()
+
+                try:
+                    self.query_one("#gatt-status").update(
+                        f"Read {char_uuid}: {hex_str[:40]}"
+                    )
+                except Exception:
+                    pass
+
+            except Exception as e:
+                try:
+                    self.query_one("#gatt-status").update(f"[red]Read error: {e}[/red]")
+                except Exception:
+                    pass
+
+        def _rebuild_table(self):
+            """Rebuild the table with current data including read values."""
+            table = self.query_one("#gatt-table")
+            table.clear()
+            self._char_rows = {}
+            row_idx = 0
+
+            for svc in self._services_data:
+                svc_label = f"SERVICE: {svc['uuid']}" + (f" ({svc['name']})" if svc['name'] else "")
+                row_key = f"svc_{row_idx}"
+                table.add_row(
+                    Text(svc_label, style="bold cyan"),
+                    Text(""),
+                    Text(""),
+                    Text(svc["uuid"], style="dim"),
+                    key=row_key,
+                )
+                row_idx += 1
+
+                for ch in svc["chars"]:
+                    char_label = f"  └ {ch['uuid']}" + (f" ({ch['name']})" if ch['name'] else "")
+                    props = ", ".join(ch["properties"])
+                    if ch["value"]:
+                        hex_str = ch["value"]
+                        val_display = hex_str[:60]
+                    else:
+                        val_display = "(not read)"
+                    row_key = f"char_{row_idx}"
+                    table.add_row(
+                        Text(char_label, style="green"),
+                        Text(props, style="yellow"),
+                        Text(val_display, style="bold white" if ch["value"] else "dim"),
+                        Text(ch["uuid"], style="dim"),
+                        key=row_key,
+                    )
+                    self._char_rows[row_key] = (svc["uuid"], ch["uuid"])
+                    row_idx += 1
+
+        def action_close(self) -> None:
+            self.run_worker(self._disconnect, exclusive=True, group="gatt-close")
+
+        async def _disconnect(self):
+            if self._client and self._client.is_connected:
+                try:
+                    # Store GATT data on tracker device if available
+                    if self.tracker:
+                        dev = self.tracker.get_by_id(self.device_uuid)
+                        if dev:
+                            dev["gatt_services"] = self._services_data
+                    await self._client.disconnect()
+                except Exception:
+                    pass
+            self.dismiss()
+
+
+    class DeviceHistoryScreen(ModalScreen):
+        """Browse all devices ever seen (from SQLite history)."""
+
+        CSS = """
+        DeviceHistoryScreen {
+            align: center middle;
+        }
+        #history-container {
+            width: 92;
+            height: 85%;
+            border: thick $primary;
+            background: $surface;
+            padding: 1 2;
+        }
+        #history-title {
+            text-style: bold;
+            text-align: center;
+            margin-bottom: 1;
+            color: $accent;
+        }
+        #history-search {
+            margin-bottom: 1;
+        }
+        #history-table {
+            height: 1fr;
+        }
+        #history-hint {
+            text-align: center;
+            margin-top: 1;
+            color: $text-muted;
+        }
+        """
+
+        BINDINGS = [
+            Binding("escape", "close", "Close"),
+        ]
+
+        def __init__(self):
+            super().__init__()
+            self._all_devices = []
+            self._filter_text = ""
+
+        def compose(self) -> ComposeResult:
+            from textual.containers import Vertical
+            with Vertical(id="history-container"):
+                yield Static("History — All Devices Ever Seen", id="history-title")
+                yield Input(placeholder="Type to filter\u2026", id="history-search")
+                yield DataTable(id="history-table", cursor_type="row")
+                yield Label("[dim]Esc to close | / to search[/dim]", id="history-hint")
+
+        async def on_mount(self) -> None:
+            table = self.query_one("#history-table")
+            table.add_column("NAME")
+            table.add_column("VENDOR")
+            table.add_column("ADDRESS")
+            table.add_column("TYPE")
+            table.add_column("LAST RSSI")
+            table.add_column("IDENTITY")
+            table.add_column("LAST SEEN")
+
+            self._all_devices = history_load_devices()
+            self._refresh_table()
+
+        def _refresh_table(self):
+            table = self.query_one("#history-table")
+            table.clear()
+            devices = self._all_devices
+
+            if self._filter_text:
+                ft = self._filter_text.lower()
+                devices = [
+                    d for d in devices
+                    if ft in (d.get("name") or "").lower()
+                    or ft in (d.get("vendor") or "").lower()
+                    or ft in (d.get("address") or "").lower()
+                    or ft in (d.get("apple_identity") or "").lower()
+                ]
+
+            for d in devices[:200]:  # limit display
+                name = d.get("name") or d.get("apple_identity") or "(unknown)"
+                vendor = d.get("vendor") or ""
+                address = d.get("address") or ""
+                dtype = d.get("type") or ""
+                rssi = d.get("last_rssi")
+                identity = d.get("apple_identity") or ""
+                last_seen = d.get("last_seen") or ""
+                # Shorten timestamp
+                if "T" in last_seen:
+                    last_seen = last_seen.split("T")[1][:8]
+
+                rssi_str = f"{rssi}dBm" if rssi is not None else "—"
+
+                base = "cyan" if dtype == "Apple" else ("green" if dtype == "Classic" else "blue")
+                table.add_row(
+                    Text(name[:36], style=base),
+                    Text(vendor[:28], style=base),
+                    Text(address, style=f"dim {base}"),
+                    Text(dtype, style=f"bold {base}"),
+                    Text(rssi_str, style=rssi_color(rssi) if rssi else "dim"),
+                    Text(identity, style=base if identity else "dim"),
+                    Text(last_seen, style="dim"),
+                )
+
+        def on_input_changed(self, event: Input.Changed) -> None:
+            if event.input.id == "history-search":
+                self._filter_text = event.value
+                self._refresh_table()
+
+        def action_close(self) -> None:
             self.dismiss()
 
 
@@ -1290,6 +1997,10 @@ def _build_tui():
             Binding("s", "scan", "Scan", show=True, priority=True),
             Binding("i", "inspect", "Inspect", show=True),
             Binding("a", "action_log", "Action Log", show=True),
+            Binding("g", "gatt_read", "GATT", show=True),
+            Binding("e", "export", "Export", show=True),
+            Binding("h", "history", "History", show=True),
+            Binding("w", "toggle_watch", "Watch", show=True),
             Binding("slash", "toggle_filter", "Filter", show=True, priority=True),
             Binding("q", "quit", "Quit", show=True, priority=True),
         ]
@@ -1303,6 +2014,8 @@ def _build_tui():
             self._tracker = DeviceTracker()
             self._filter_text = ""
             self._scanning = False
+            self._watched = set()
+            self._watch_alerts = []  # list of alert messages
 
         def compose(self) -> ComposeResult:
             yield Input(
@@ -1313,6 +2026,31 @@ def _build_tui():
             yield Static(self._status_text(), id="status-bar")
 
         async def on_mount(self) -> None:
+            # Initialize history database
+            try:
+                init_history_db()
+                history_prune()
+            except Exception:
+                pass
+            # Load watched devices
+            try:
+                self._watched = load_watched()
+            except Exception:
+                pass
+            # Load previous devices from history into tracker
+            try:
+                prev_devices = history_load_devices()
+                for pd in prev_devices:
+                    sid = pd["id"]
+                    if sid not in self._tracker.devices:
+                        entry = dict(pd)
+                        entry["first_seen"] = datetime.now()
+                        entry["last_seen"] = datetime.now()
+                        entry["zone_history"] = []
+                        entry["apple_details"] = []
+                        self._tracker.devices[sid] = entry
+            except Exception:
+                pass
             table = self.query_one(DataTable)
             table.add_column("NAME")
             table.add_column("VENDOR")
@@ -1321,6 +2059,7 @@ def _build_tui():
             table.add_column("SIGNAL")
             table.add_column("IDENTITY")
             table.focus()
+            self._refresh_table()
             await self._run_scan()
 
         # ── Actions ────────────────────────────────────────────────
@@ -1363,6 +2102,107 @@ def _build_tui():
             if 0 <= idx < len(devices):
                 self.push_screen(DeviceActionLogScreen(devices[idx]))
 
+        def action_gatt_read(self) -> None:
+            """Open GATT service browser for selected device."""
+            table = self.query_one(DataTable)
+            if table.cursor_row is None:
+                return
+            devices = self._tracker.get_sorted()
+            if self._filter_text:
+                ft = self._filter_text.lower()
+                devices = [d for d in devices if ft in (d.get("name") or "").lower() or ft in (d.get("vendor") or "").lower() or ft in (d.get("apple_identity") or "").lower()]
+            idx = table.cursor_row
+            if 0 <= idx < len(devices):
+                dev = devices[idx]
+                addr = dev.get("address") or dev["id"]
+                self.push_screen(DeviceGATTScreen(addr, tracker=self._tracker))
+
+        def action_export(self) -> None:
+            """Export selected device profile to Desktop/btradar-export.json."""
+            table = self.query_one(DataTable)
+            if table.cursor_row is None:
+                return
+            devices = self._tracker.get_sorted()
+            if self._filter_text:
+                ft = self._filter_text.lower()
+                devices = [d for d in devices if ft in (d.get("name") or "").lower() or ft in (d.get("vendor") or "").lower() or ft in (d.get("apple_identity") or "").lower()]
+            idx = table.cursor_row
+            if 0 <= idx < len(devices):
+                dev = devices[idx]
+                export = {
+                    "exported": datetime.now().isoformat(),
+                    "version": __version__,
+                    "device": {
+                        "id": dev["id"],
+                        "name": dev.get("name", ""),
+                        "vendor": dev.get("vendor", ""),
+                        "address": dev.get("address", ""),
+                        "type": dev.get("type", ""),
+                        "rssi": dev.get("rssi"),
+                        "random": dev.get("random", False),
+                        "paired": dev.get("paired", False),
+                        "connected": dev.get("connected", False),
+                        "apple_identity": dev.get("apple_identity"),
+                        "apple_details": [
+                            {"type": t, "detail": detail}
+                            for t, detail in dev.get("apple_details", [])
+                        ],
+                    },
+                }
+                # Include GATT services if read
+                if dev.get("gatt_services"):
+                    export["device"]["gatt_services"] = dev["gatt_services"]
+                # Include proximity zone history from DB
+                try:
+                    zones = history_get_zone_history(dev["id"])
+                    export["device"]["zone_history"] = zones
+                except Exception:
+                    export["device"]["zone_history"] = []
+                # Include event counts
+                try:
+                    export["device"]["total_events"] = history_get_event_count(dev["id"])
+                    export["device"]["events_per_minute"] = history_get_events_per_minute(dev["id"])
+                except Exception:
+                    pass
+
+                export_path = os.path.expanduser("~/Desktop/btradar-export.json")
+                try:
+                    os.makedirs(os.path.dirname(export_path), exist_ok=True)
+                    with open(export_path, "w") as f:
+                        json.dump(export, f, indent=2, default=str)
+                    self._update_status_bar(f"Exported to {export_path}")
+                except Exception as e:
+                    self._update_status_bar(f"Export failed: {e}")
+
+        def action_history(self) -> None:
+            """Open history screen showing all devices ever seen."""
+            self.push_screen(DeviceHistoryScreen())
+
+        def action_toggle_watch(self) -> None:
+            """Toggle watch on selected device."""
+            table = self.query_one(DataTable)
+            if table.cursor_row is None:
+                return
+            devices = self._tracker.get_sorted()
+            if self._filter_text:
+                ft = self._filter_text.lower()
+                devices = [d for d in devices if ft in (d.get("name") or "").lower() or ft in (d.get("vendor") or "").lower() or ft in (d.get("apple_identity") or "").lower()]
+            idx = table.cursor_row
+            if 0 <= idx < len(devices):
+                dev = devices[idx]
+                dev_id = dev["id"]
+                name = dev.get("name") or dev.get("apple_identity") or dev_id[:12]
+                if dev_id in self._watched:
+                    self._watched.discard(dev_id)
+                    self._update_status_bar(f"Stopped watching: {name}")
+                else:
+                    self._watched.add(dev_id)
+                    self._update_status_bar(f"Now watching: {name}")
+                try:
+                    save_watched(self._watched)
+                except Exception:
+                    pass
+
         async def _run_scan(self) -> None:
             self._scanning = True
             self._update_status_bar("Scanning\u2026")
@@ -1383,7 +2223,30 @@ def _build_tui():
             self._scanning = False
             self._tracker.update(devices)
             self._refresh_table()
+            # Check for watched device alerts
+            self._check_watched_devices(devices)
             self._update_status_bar()
+
+        def _check_watched_devices(self, devices):
+            """Check if any watched device appeared in scan results."""
+            if not self._watched:
+                return
+            new_alerts = []
+            for dev in devices:
+                dev_id = dev["id"]
+                if dev_id in self._watched:
+                    name = dev.get("name") or dev.get("apple_identity") or dev_id[:12]
+                    alert = f"⚠ Watched device appeared: {name} ({dev.get('rssi', '?')}dBm)"
+                    new_alerts.append(alert)
+                    # Send macOS notification
+                    _send_notification(
+                        "btradar Watch Alert",
+                        f"{name} appeared at {dev.get('rssi', '?')}dBm"
+                    )
+            if new_alerts:
+                self._watch_alerts = new_alerts[-5:]  # keep last 5
+                alert_str = " │ ".join(self._watch_alerts)
+                self._update_status_bar(alert_str)
 
         def action_toggle_filter(self) -> None:
             filter_input = self.query_one("#filter-input")
@@ -1524,7 +2387,7 @@ def _build_tui():
             else:
                 parts = [
                     f"btradar v{__version__}",
-                    "s:scan  Enter:inspect  /:filter  q:quit",
+                    "s:scan  i:inspect  a:log  g:gatt  e:export  h:hist  w:watch  /:filter  q:quit",
                     f"{count} device(s){filter_info}",
                     ts,
                 ]
