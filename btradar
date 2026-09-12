@@ -3024,19 +3024,42 @@ def main():
 
     # Update
     if args.command == "update":
-        import shutil
+        import shutil, hashlib
         url = "https://raw.githubusercontent.com/LarryClaw-sudo/btradar/main/btradar"
         target = os.path.abspath(sys.argv[0])
-        print(f"Downloading latest btradar from {url}...")
+        print(f"Current: {target}")
+        print(f"Version before: {__version__}")
+        print(f"Downloading from {url}...")
         try:
             import urllib.request
-            urllib.request.urlretrieve(url, target + ".new")
-            os.chmod(target + ".new", 0o755)
-            shutil.move(target + ".new", target)
-            print(f"Updated! Restart btradar to use the new version.")
+            tmp = target + ".update_tmp"
+            urllib.request.urlretrieve(url, tmp)
+            # Verify it's valid Python
+            result = subprocess.run([sys.executable, "-m", "py_compile", tmp], capture_output=True)
+            if result.returncode != 0:
+                print(f"Downloaded file has syntax errors, aborting.")
+                os.remove(tmp)
+                return
+            os.chmod(tmp, 0o755)
+            # Remove old file first, then move
+            if os.path.exists(target):
+                os.remove(target)
+            shutil.move(tmp, target)
+            # Clear any .pyc cache
+            pycache = os.path.join(os.path.dirname(target), "__pycache__")
+            if os.path.isdir(pycache):
+                import glob
+                for f in glob.glob(os.path.join(pycache, "btradar*")):
+                    os.remove(f)
+            # Verify replacement
+            result = subprocess.run([target, "--version"], capture_output=True, text=True)
+            new_ver = result.stdout.strip() if result.returncode == 0 else "unknown"
+            print(f"Updated! New version: {new_ver}")
+            print(f"Restart btradar to use it.")
         except Exception as e:
             print(f"Update failed: {e}")
-            print(f"You can also manually download from: {url}")
+            print(f"Manual download: {url}")
+            print(f"Then: cp ~/Downloads/btradar /opt/homebrew/bin/btradar && chmod +x /opt/homebrew/bin/btradar")
         return
 
     # Determine scan mode
