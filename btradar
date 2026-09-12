@@ -1186,7 +1186,7 @@ class DeviceTracker:
         """Return devices sorted by RSSI (strongest first)."""
         return sorted(
             self.devices.values(),
-            key=lambda d: d["rssi"] if d["rssi"] is not None else -999,
+            key=lambda d: d.get("rssi") or d.get("last_rssi") or -999,
             reverse=True,
         )
 
@@ -1897,7 +1897,7 @@ def _build_tui():
             self.tracker = tracker
             self._client = None
             self._services_data = []
-            self._char_rows = {}  # row_key -> (service_uuid, char_uuid)
+            self._char_rows = {}; self._all_row_keys = []  # row_key -> (service_uuid, char_uuid)
             self._audit_findings = []
             self._security_score = None
 
@@ -1945,7 +1945,7 @@ def _build_tui():
             try:
                 table = self.query_one("#gatt-table")
                 self._services_data = []
-                self._char_rows = {}
+                self._char_rows = {}; self._all_row_keys = []
                 row_idx = 0
 
                 for service in self._client.services:
@@ -2049,7 +2049,7 @@ def _build_tui():
             table = self.query_one("#gatt-table")
             if table.cursor_row is None:
                 return
-            row_key = str(table.cursor_row_key)
+            row_idx = table.cursor_row; row_key = self._all_row_keys[row_idx] if row_idx is not None and row_idx < len(self._all_row_keys) else None
             if row_key not in self._char_rows:
                 return  # Not a characteristic row
             self.run_worker(
@@ -2126,7 +2126,7 @@ def _build_tui():
             """Rebuild the table with current data including read values."""
             table = self.query_one("#gatt-table")
             table.clear()
-            self._char_rows = {}
+            self._char_rows = {}; self._all_row_keys = []
             row_idx = 0
 
             for svc in self._services_data:
@@ -2838,7 +2838,7 @@ def one_shot_table(classic_sec, ble_sec, classic_only, ble_only):
     console = Console()
     devices = do_scan(classic_sec, ble_sec, classic_only, ble_only)
     devices.sort(
-        key=lambda d: d["rssi"] if d["rssi"] is not None else -999, reverse=True
+        key=lambda d: d.get("rssi") or d.get("last_rssi") or -999, reverse=True
     )
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -2880,7 +2880,7 @@ def json_output(classic_sec, ble_sec, classic_only, ble_only):
     """Single scan, JSON output."""
     devices = do_scan(classic_sec, ble_sec, classic_only, ble_only)
     devices.sort(
-        key=lambda d: d["rssi"] if d["rssi"] is not None else -999, reverse=True
+        key=lambda d: d.get("rssi") or d.get("last_rssi") or -999, reverse=True
     )
 
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
